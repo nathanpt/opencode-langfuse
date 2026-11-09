@@ -9,7 +9,7 @@
         "Start opencode (or run: opencode service restart) and run: opencode plugin list",
         "Confirm the plugin id appears active and startup logs show the Langfuse tracing banner with the configured host and no load errors"
       ],
-      "passes": false,
+      "passes": true,
       "priority": 1,
       "dependencies": []
     },
@@ -124,7 +124,7 @@
         "Set credentials via the accepted mechanism (env vars and/or config file per ADR-0001) and verify tracing activates",
         "Verify credentials never appear in traces or logs"
       ],
-      "passes": false,
+      "passes": true,
       "priority": 1,
       "dependencies": ["feature-001"]
     },

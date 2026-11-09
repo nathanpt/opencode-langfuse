@@ -1,0 +1,41 @@
+{
+  "name": "opencode-langfuse",
+  "version": "0.0.1",
+  "description": "Langfuse observability plugin for OpenCode v2. One trace per session with self-computed cost.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "dist"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/index.js --log-level=warning"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "langfuse",
+    "observability",
+    "tracing",
+    "llm"
+  ],
+  "dependencies": {
+    "@opencode/plugin": "latest",
+    "zod": "^4"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "esbuild": "^0.28.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}
