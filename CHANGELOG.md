@@ -15,3 +15,9 @@ All notable changes to this project are documented in this file. Format based on
   announces tracing state at startup; credential resolution per ADR-0001 (env vars → 0600 config
   file at `~/.config/opencode-langfuse/config.json` → disabled with a stated reason). Verified
   live against OpenCode v2.0.31 (load, banner, env-over-file precedence).
+- Per-session tracing (feature-002): one Langfuse trace with a root agent observation per primary
+  session — input = user prompt (`session.inbox.enqueued`), output = final assistant response
+  (`session.text.ended`), flushed on `session.execution.succeeded` + 1.5 s grace window through
+  the REST ingestion transport (redaction + privacy presets ported from omp-langfuse). A missed
+  `session.created` (cold-load race with the event bus) reconciles via `ctx.session.get`.
+  Verified live against the self-hosted Langfuse from a cold plugin load.

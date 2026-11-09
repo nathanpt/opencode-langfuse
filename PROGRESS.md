@@ -19,7 +19,13 @@
   host `https://ingest.nathanpeet.com`) → `Tracing enabled … source file`; env vars present in
   the server process → `Tracing enabled → https://cloud.langfuse.com … source env`
   (env-over-file precedence proven with the file present).
-- `npm run typecheck` (clean) and `npm test` (11/11) green; `npm run build` produces
+- **feature-002 (passing, live-verified 2026-11-09):** one Langfuse trace + one root agent
+  observation per primary session through the REST ingestion transport. Cold-boot first session
+  (the regression case) traces correctly; input = user prompt, output = final assistant response;
+  subagent child sessions produce no trace (parent only). Evidence: traces
+  `ses_e3d8e4334ffeEbP8eCFrsPAMpo` / `ses_e3d8e34c8ffeML1NGqG8vUvTIF` on
+  `https://ingest.nathanpeet.com`, root SPAN IO matches trace IO, bounded start/end times.
+- `npm run typecheck` (clean) and `npm test` (34/34) green; `npm run build` produces
   `dist/index.js` (~1.7 MB, self-contained).
 - Verification harness: scratch project `/tmp/oc-verify` (mock OpenAI-compatible provider on
   `127.0.0.1:8123` from `/tmp/r1-probe/mock-server.mjs`, plugin under `.opencode/plugins/`,
@@ -28,6 +34,18 @@
 
 ## Operational findings worth remembering
 
+- **Cold-load event race (fixed in feature-002):** a plugin's `ctx.event.subscribe()` attaches
+  ~60 ms after `setup`, so `session.created` of the first session races it and can be missed.
+  The tracker reconciles unknown-session prompts via `ctx.session.get` (`parentID` check;
+  children skipped; lookup failure fails open). Reload-created plugin instances attach to the
+  live bus instantly — but production loads at service boot, so the reconciliation path is the
+  load-bearing one.
+- **`session.created` for children** carries `parentID`; `ctx.session.get({sessionID})` returns
+  `Session.Info` (also carries it) — the lookup fallback distinguishes children from primaries
+  when the created event is missed.
+- The ingest host (`ingest.nathanpeet.com`, proxied) rejects the python-urllib user-agent with
+  403 while curl/fetch pass — verification scripts must use curl, and any future HTTP client
+  change should re-check this.
 - `opencode plugin list` and `GET /api/plugin` are **home/global-location scoped** — they do not
   list project-scoped plugins, and (on 2.0.31) the config `plugins` array with an absolute local
   directory entry (object or string form) is silently skipped; the reliable dev/verify path is a
@@ -40,9 +58,8 @@
 
 ## Active work
 
-- **feature-002** — one Langfuse trace per session with a root observation (first live trace
-  through the transport port of sibling `langfuse.ts`), verified against the self-hosted
-  Langfuse (`https://ingest.nathanpeet.com`, keys in `~/.config/opencode-langfuse/config.json`).
+- **feature-003** — one generation observation per primary model request with token counts and
+  self-computed cost (ADR-0002), auxiliary requests (title/compaction/generate) tagged.
 
 ## Blockers and unknowns
 
@@ -51,12 +68,14 @@
 
 ## Verification status
 
-- feature-001: passing (live evidence above, 2026-11-09).
-- feature-010: passing (live evidence above, 2026-11-09).
-- Features 002–013: failing/unverified (see docs/feature-list.json).
+- feature-001: passing (live evidence, 2026-11-09).
+- feature-010: passing (live evidence, 2026-11-09).
+- feature-002: passing (live evidence above, 2026-11-09).
+- Features 003–013: failing/unverified (see docs/feature-list.json).
 
 ## Next useful move
 
-- Implement feature-002: port the transport (`src/langfuse.ts` equivalent) with per-session
-  flush, wire `session.execution.succeeded` + grace window, run a real session, and fetch the
-  newest trace from the Langfuse API to assert the trace + root observation.
+- Implement feature-003: per-generation observations from `session.step.started/ended`
+  (tokens per request), price resolution layers per ADR-0002, auxiliary-request tagging via
+  `http.*` hook `kind`; verify a two-request tool-loop session produces two generations with
+  correct token/cost fields.

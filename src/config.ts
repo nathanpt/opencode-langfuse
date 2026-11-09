@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { z } from "zod"
+import type { PrivacyPreset } from "./capture-policy.js"
 
 const DEFAULT_HOST = "https://cloud.langfuse.com"
 const CONFIG_FILE_RELPATH = ".config/opencode-langfuse/config.json"
@@ -34,6 +35,7 @@ export interface ResolvedConfig {
   publicKey: string
   secretKey: string
   host: string
+  privacyPreset?: PrivacyPreset
 }
 
 export interface UnresolvedConfig {
@@ -98,6 +100,9 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Crede
       publicKey: fromFile.config.publicKey,
       secretKey: fromFile.config.secretKey,
       host: fromFile.config.host ?? DEFAULT_HOST,
+      ...(fromFile.config.privacyPreset !== undefined
+        ? { privacyPreset: fromFile.config.privacyPreset }
+        : {}),
     }
   }
 

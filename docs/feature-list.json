@@ -22,7 +22,7 @@
         "Run: opencode run \"use bash to run: echo hi\"",
         "Fetch the newest trace from the Langfuse API and verify: one trace per session, root observation input contains the user prompt and output contains the final assistant response"
       ],
-      "passes": false,
+      "passes": true,
       "priority": 1,
       "dependencies": ["feature-001", "feature-010"]
     },

@@ -40,7 +40,7 @@ setup(ctx)
 ├── observe     hook/event → observation builders: session, generation, tool, compaction
 ├── pricing     price resolution + cost          port of pricing.ts; layered resolution per ADR-0002
 ├── metadata    git/repo source metadata         via ctx.vcs (replaces sibling's manual git)
-├── transport   @langfuse/otel OTel runtime + REST fallback + scores + flush/shutdown
+├── transport   Langfuse REST ingestion client + flush/shutdown (scores land with a later feature)
 └── state       per-session state + score aggregation, keyed by sessionID
 ```
 
@@ -85,9 +85,12 @@ scores (`tool_call_count`, `turn_count`, `total_tool_errors`, `tool_success_rate
    long-lived server process; sessions end without unloading it (one `setup` across seven runs),
    and the cleanup function fires on unload/reload only (four observed). Flush is per session:
    on `session.execution.succeeded` (parent and each child session), hold a bounded grace window
-   (~1.5 s — the sibling's OTel visibility timeout) for trailing title/usage/child traffic, then
-   flush that session's batch; the cleanup function performs the final timeout-bounded shutdown
-   with the REST fallback for OTel traces that did not materialize (sibling-proven need).
+   (~1.5 s) for trailing title/usage/child traffic, then flush that session's batch; the cleanup
+   function performs the final timeout-bounded shutdown. The transport is REST-only
+   (`POST /api/public/ingestion`, one retry, per-event 207 acceptance replaces the sibling's
+   OTel queue + REST fallback). `session.created` can race the event subscription on a cold
+   plugin load, so a prompt for an unknown session reconciles via `ctx.session.get` (primaries
+   become records; children stay skipped; lookup failure fails open).
 
 ## Where to look next
 
