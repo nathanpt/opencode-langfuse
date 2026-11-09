@@ -1,0 +1,169 @@
+{
+  "features": [
+    {
+      "id": "feature-001",
+      "category": "functional",
+      "description": "The plugin loads in OpenCode v2 without errors and announces tracing",
+      "steps": [
+        "Place the built plugin under .opencode/plugins/ in a test project",
+        "Start opencode (or run: opencode service restart) and run: opencode plugin list",
+        "Confirm the plugin id appears active and startup logs show the Langfuse tracing banner with the configured host and no load errors"
+      ],
+      "passes": false,
+      "priority": 1,
+      "dependencies": []
+    },
+    {
+      "id": "feature-002",
+      "category": "functional",
+      "description": "One Langfuse trace is created per OpenCode session with a root observation",
+      "steps": [
+        "Configure credentials (env vars per the accepted config ADR)",
+        "Run: opencode run \"use bash to run: echo hi\"",
+        "Fetch the newest trace from the Langfuse API and verify: one trace per session, root observation input contains the user prompt and output contains the final assistant response"
+      ],
+      "passes": false,
+      "priority": 1,
+      "dependencies": ["feature-001", "feature-010"]
+    },
+    {
+      "id": "feature-003",
+      "category": "functional",
+      "description": "One generation observation per primary model request, auxiliary requests tagged",
+      "steps": [
+        "Run a multi-turn session that also produces a title generation",
+        "Verify the trace contains one generation per primary agent-loop model request with the true model id",
+        "Verify auxiliary requests (title/compaction/generate kinds) are either separate tagged generations or recorded as metadata, never silently merged into primary generations"
+      ],
+      "passes": false,
+      "priority": 1,
+      "dependencies": ["feature-002"]
+    },
+    {
+      "id": "feature-004",
+      "category": "functional",
+      "description": "Token usage is recorded on generations",
+      "steps": [
+        "Run a session and fetch the newest trace",
+        "Verify each primary generation carries usageDetails (input/output, cache fields where the provider reports them) matching the usage OpenCode reports for that request",
+        "Verify usage comes from the capture point decided in R1, not guessed"
+      ],
+      "passes": false,
+      "priority": 1,
+      "dependencies": ["feature-003"]
+    },
+    {
+      "id": "feature-005",
+      "category": "functional",
+      "description": "Cost is self-computed from token usage and a resolved price",
+      "steps": [
+        "Run a session on a model with a resolvable price and verify costDetails on generations equal usage × resolved per-token price",
+        "Run a session on a model with no resolvable price and verify cost is omitted with a one-time warning (not a zero)",
+        "Verify host-reported cost values are never trusted without the proof required by AGENTS.md constraint 2"
+      ],
+      "passes": false,
+      "priority": 1,
+      "dependencies": ["feature-004"]
+    },
+    {
+      "id": "feature-006",
+      "category": "functional",
+      "description": "Tool calls become observations with error level on failure",
+      "steps": [
+        "Run a session with successful tool calls and one intentional failure (non-zero bash exit)",
+        "Verify each tool call produces an observation named for the tool",
+        "Verify the failing call has level=ERROR / isError=true derived from execute.after status, not from payload content"
+      ],
+      "passes": false,
+      "priority": 2,
+      "dependencies": ["feature-002"]
+    },
+    {
+      "id": "feature-007",
+      "category": "functional",
+      "description": "Context compaction is recorded as a span",
+      "steps": [
+        "Drive a session long enough to compact (or otherwise trigger a compaction request)",
+        "Verify the trace records a compaction span tagged with kind=compaction"
+      ],
+      "passes": false,
+      "priority": 2,
+      "dependencies": ["feature-002"]
+    },
+    {
+      "id": "feature-008",
+      "category": "functional",
+      "description": "Trace-level scores are attached when the session ends",
+      "steps": [
+        "Run a multi-tool session with one intentional failure and fetch the newest trace",
+        "Verify all five scores: tool_call_count, turn_count, total_tool_errors, tool_success_rate, session_had_errors — and that their values match the observed run"
+      ],
+      "passes": false,
+      "priority": 2,
+      "dependencies": ["feature-006"]
+    },
+    {
+      "id": "feature-009",
+      "category": "functional",
+      "description": "Privacy presets and redaction govern every captured payload",
+      "steps": [
+        "Set preset metadata-only and verify the trace contains no prompt/response/tool content",
+        "Set preset full-debug, seed a session with a fake API key in tool output, and verify the key is redacted in the captured payload",
+        "Verify per-field env overrides (LANGFUSE_CAPTURE_*) still take precedence over the preset"
+      ],
+      "passes": false,
+      "priority": 2,
+      "dependencies": ["feature-002"]
+    },
+    {
+      "id": "feature-010",
+      "category": "functional",
+      "description": "Credentials resolve per the accepted config decision and absence degrades cleanly",
+      "steps": [
+        "With no credentials configured, start opencode in a project with the plugin and verify it loads, stays disabled, and states why (no crash, no trace attempts)",
+        "Set credentials via the accepted mechanism (env vars and/or config file per ADR-0001) and verify tracing activates",
+        "Verify credentials never appear in traces or logs"
+      ],
+      "passes": false,
+      "priority": 1,
+      "dependencies": ["feature-001"]
+    },
+    {
+      "id": "feature-011",
+      "category": "functional",
+      "description": "Source/git metadata is recorded on the trace",
+      "steps": [
+        "Run a session inside this git repository and fetch the newest trace",
+        "Verify trace metadata includes source_type, git_branch, git_commit, and repo identity sourced from ctx.vcs",
+        "Verify a metadata-override file at the repo root can override/add the documented keys"
+      ],
+      "passes": false,
+      "priority": 3,
+      "dependencies": ["feature-002"]
+    },
+    {
+      "id": "feature-012",
+      "category": "functional",
+      "description": "Slash commands for status and connectivity test are available",
+      "steps": [
+        "Confirm /langfuse-status reports config source, host, masked public key, preset, capture flags, and last runtime error",
+        "Run /langfuse-test and verify a standalone test trace arrives in Langfuse"
+      ],
+      "passes": false,
+      "priority": 3,
+      "dependencies": ["feature-002"]
+    },
+    {
+      "id": "feature-013",
+      "category": "functional",
+      "description": "Subagent/child-session runs are grouped under the parent session trace",
+      "steps": [
+        "Run a session that spawns a subagent (per the R3 findings on OpenCode's child-session model)",
+        "Verify child traces are named and grouped under the parent session with parent linkage, or the feature is consciously descoped with the R3 evidence recorded"
+      ],
+      "passes": false,
+      "priority": 3,
+      "dependencies": ["feature-003"]
+    }
+  ]
+}
