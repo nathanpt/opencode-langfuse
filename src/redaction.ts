@@ -37,6 +37,25 @@ export function hashPath(path: string): string {
   return `[PATH_HASH:${createHash("sha256").update(path).digest("hex").slice(0, 12)}]`
 }
 
+/**
+ * Safe display form of a configured host (feature-012): strips userinfo,
+ * query, and fragment, retains origin/base path, then applies the standard
+ * string redactor. Invalid URLs never echo the unparsed input.
+ */
+export function redactHost(host: string): string {
+  try {
+    const parsed = new URL(host)
+    parsed.username = ""
+    parsed.password = ""
+    parsed.search = ""
+    parsed.hash = ""
+    const safe = parsed.toString()
+    return redactString(safe.length > 0 ? safe : "[invalid host]")
+  } catch {
+    return "[invalid host]"
+  }
+}
+
 function truncate(value: string, maxStringLength: number): string {
   return value.length > maxStringLength ? `${value.slice(0, maxStringLength)}... [truncated]` : value
 }

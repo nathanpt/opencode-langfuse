@@ -26,6 +26,9 @@ export const PRICE_PER_MILLION = 1_000_000
 /** Overall source-metadata collection deadline (feature-011). */
 export const SOURCE_METADATA_TIMEOUT_MS = 2_000
 
+/** Overall standalone test-command abort deadline (feature-012). */
+export const LANGFUSE_TEST_TIMEOUT_MS = 15_000
+
 /** Override-file size bound: reads must never buffer unbounded repository files. */
 export const MAX_SOURCE_METADATA_FILE_BYTES = 65_536
 

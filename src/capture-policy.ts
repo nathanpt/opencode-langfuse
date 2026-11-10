@@ -92,10 +92,20 @@ function normalizePreset(value: string | undefined): PrivacyPreset {
   return value && value in PRESETS ? (value as PrivacyPreset) : "full-debug"
 }
 
+/**
+ * Resolves the base privacy preset: environment over file (ADR-0001), with
+ * the documented fallback. Overrides never invent a separate preset.
+ */
+export function resolvePrivacyPreset(options: { preset?: string; env?: EnvLike } = {}): PrivacyPreset {
+  const env = options.env ?? (process.env as EnvLike)
+  return normalizePreset(env.LANGFUSE_PRIVACY_PRESET ?? options.preset)
+}
+
 export function createCapturePolicy(options: { preset?: string; env?: EnvLike } = {}): CapturePolicy {
   const env = options.env ?? (process.env as EnvLike)
-  const basePreset = env.LANGFUSE_PRIVACY_PRESET ?? options.preset
-  const policy: { -readonly [K in keyof CapturePolicy]: CapturePolicy[K] } = { ...PRESETS[normalizePreset(basePreset)] }
+  const policy: { -readonly [K in keyof CapturePolicy]: CapturePolicy[K] } = {
+    ...PRESETS[resolvePrivacyPreset({ preset: options.preset, env })],
+  }
   for (const [envName, field] of Object.entries(FLAG_TO_FIELD) as Array<
     [keyof typeof FLAG_TO_FIELD, (typeof FLAG_TO_FIELD)[keyof typeof FLAG_TO_FIELD]]
   >) {

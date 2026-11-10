@@ -167,10 +167,10 @@
       "category": "functional",
       "description": "Slash commands for status and connectivity test are available",
       "steps": [
-        "Confirm /langfuse-status reports config source, host, masked public key, preset, capture flags, and last runtime error",
+        "Confirm /langfuse-status reports config source, host, masked public key, preset, capture flags, and last runtime error in the server log (no TUI/UI channel)",
         "Run /langfuse-test and verify a standalone test trace arrives in Langfuse"
       ],
-      "passes": false,
+      "passes": true,
       "priority": 3,
       "dependencies": [
         "feature-002"

@@ -9,7 +9,7 @@
 
 import { INGEST_TIMEOUT_MS } from "./constants.js"
 import { isRecord } from "./guards.js"
-import { redactValue } from "./redaction.js"
+import { redactHost, redactValue } from "./redaction.js"
 
 export interface LangfuseEndpointConfig {
   host: string
@@ -43,6 +43,8 @@ export interface TransportOptions {
   attempts?: number
   fetchImpl?: typeof fetch
   log?: (message: string) => void
+  /** Final-delivery failure notice: retry exhaustion or rejected 207 events (feature-012). */
+  onError?: (message: string) => void
 }
 
 interface IngestionError {
@@ -56,7 +58,14 @@ export function createLangfuseTransport(config: LangfuseEndpointConfig, options:
   const attempts = Math.max(1, options.attempts ?? 2)
   const fetchImpl = options.fetchImpl ?? fetch
   const log = options.log ?? ((message: string) => console.warn(`📊 Langfuse: ${message}`))
+  const onError = options.onError
   const authorization = `Basic ${Buffer.from(`${config.publicKey}:${config.secretKey}`).toString("base64")}`
+  // Credentials in an invalid-URL error must never echo through messages or
+  // logs: occurrences of the raw configured host are replaced by the safe
+  // display form before redaction.
+  const safeHost = redactHost(config.host)
+  const describeError = (error: unknown): string =>
+    String(redactValue((error instanceof Error ? error.message : String(error)).split(config.host).join(safeHost)))
 
   async function attempt(events: IngestEvent[], signal: AbortSignal | undefined): Promise<IngestResult> {
     const timeout = AbortSignal.timeout(timeoutMs)
@@ -100,7 +109,15 @@ export function createLangfuseTransport(config: LangfuseEndpointConfig, options:
           break
         }
         try {
-          return await attempt(events, options?.signal)
+          const result = await attempt(events, options?.signal)
+          if (result.failed > 0) {
+            // 207 with rejected events is a final delivery failure; a
+            // transient attempt that later succeeds never notifies.
+            const message = `Ingestion partially rejected: ${result.failed}/${events.length} event(s) not accepted by ${safeHost}`
+            log(message)
+            onError?.(message)
+          }
+          return result
         } catch (error) {
           lastError = error
           if (options?.signal?.aborted) {
@@ -108,7 +125,9 @@ export function createLangfuseTransport(config: LangfuseEndpointConfig, options:
           }
         }
       }
-      log(`Failed to ingest ${events.length} event(s) to ${config.host}: ${String(redactValue(String(lastError)))}`)
+      const message = `Failed to ingest ${events.length} event(s) to ${safeHost}: ${describeError(lastError)}`
+      log(message)
+      onError?.(message)
       return { accepted: 0, failed: events.length }
     },
   }

@@ -294,6 +294,8 @@ export interface TrackerOptions {
   newId?: () => string
   now?: () => number
   log?: (message: string) => void
+  /** Plugin runtime-error notice from diagnostics, failed persists, and the shutdown drain (feature-012). */
+  onError?: (message: string) => void
   /** Cold-load reconciliation: children (parentID) are skipped; failure fails open. */
   lookupSession?(sessionID: string): Promise<SessionSnapshot | undefined>
   /** Bounded collection of source facts for a session's own directory (feature-011). */
@@ -519,6 +521,23 @@ export function createTracker(options: TrackerOptions): Tracker {
   const lookupSourceMetadata = options.lookupSourceMetadata
   const lookupAssistant = options.lookupAssistant
   const lookupTool = options.lookupTool
+  const onError = options.onError
+
+  /**
+   * A diagnostic is a plugin runtime error (lookup failures, malformed
+   * payloads, failed persists): it goes to the log and to the retained
+   * last-error slot. Capacity/pricing/score-omission warnings use `log()`
+   * directly and never record. Observer failures must not alter delivery.
+   */
+  function diagnostic(message: string): void {
+    const text = truncate(String(redactValue(message)), DIAGNOSTIC_LIMIT)
+    log(text)
+    try {
+      onError?.(text)
+    } catch {
+      // Swallowed: the observer can never change acceptance or cleanup.
+    }
+  }
 
   const states = new Map<string, SessionState>()
   const stateChains = new Map<string, Promise<void>>()
@@ -534,10 +553,6 @@ export function createTracker(options: TrackerOptions): Tracker {
 
   let closed = false
   let shutdownPromise: Promise<void> | undefined
-
-  function diagnostic(message: string): void {
-    log(truncate(String(redactValue(message)), DIAGNOSTIC_LIMIT))
-  }
 
   function sessionIdentity(sessionID: string): SessionIdentity {
     return {
@@ -1948,7 +1963,13 @@ export function createTracker(options: TrackerOptions): Tracker {
 
       const result = await transport.ingest(events, signal ? { signal } : undefined)
       if (result.failed > 0) {
-        log(`Failed to persist ${result.failed}/${events.length} event(s) for session ${sessionID}`)
+        const text = `Failed to persist ${result.failed}/${events.length} event(s) for session ${sessionID}`
+        log(text)
+        try {
+          onError?.(text)
+        } catch {
+          // Observer failures never alter export bookkeeping.
+        }
       }
       resetCapacityEpisode(st)
       pruneSettledGenerations(st)
@@ -2529,7 +2550,13 @@ export function createTracker(options: TrackerOptions): Tracker {
               (st) => st.rootDirty || pendingGenerationCount(st) > 0 || pendingToolCount(st) > 0 || pendingCompactionCount(st) > 0,
             ).length
             if (unsettled > 0) {
-              log(`Shutdown drain incomplete for ${unsettled} session(s) after ${shutdownTimeoutMs}ms`)
+              const text = `Shutdown drain incomplete for ${unsettled} session(s) after ${shutdownTimeoutMs}ms`
+              log(text)
+              try {
+                onError?.(text)
+              } catch {
+                // Observer failures never alter cleanup.
+              }
             }
           }
         } finally {

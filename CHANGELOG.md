@@ -18,6 +18,21 @@ All notable changes to this project are documented in this file. Format based on
   files are ignored with one fixed diagnostic, and every retained value passes the redactor.
   Metadata rides trace metadata only (reasserted on updates), under every privacy preset; no
   trustworthy session directory means no fabricated source.
+- Operational commands (feature-012): `/langfuse-status` and `/langfuse-test` are registered
+  before the unconfigured early-return, so both exist while tracing is disabled. Commands are
+  server-log-only: they never touch the tracker, never drive a model API, and never change the
+  host conversation. Status reports state, config source (`env|file|none`), redacted host
+  (`redactHost`: invalid URLs display `[invalid host]` and never echo credentials), masked
+  public key, resolved base preset, the actual five capture flags, and the retained last
+  runtime error (scope, redacted ≤300-char message, ISO timestamp; the last failure survives
+  later successes until another failure or plugin reload). `/langfuse-test` ingests one
+  standalone `opencode-langfuse-test` trace/root per invocation through the active transport
+  (15 s deadline combined with unload cancellation), metadata exactly
+  `{source:"opencode-langfuse", command:"langfuse-test"}`, gated by the capture policy — no
+  session grouping, scores, or tracker mutation. Transport and tracker expose `onError` hooks:
+  final retry exhaustion, 207 partial rejections, diagnostics, failed persists, and shutdown
+  drain failures record into the plugin-instance-local slot; capacity/pricing/score-omission
+  warnings never do.
 - Tool observations (feature-006): one root-parented span per exact tool call, paired by the
   full `(sessionID, assistantMessageID, toolCallID)` identity with deterministic ids. Failure
   classification follows the operator-selected rule — the `execute.after` error status or a

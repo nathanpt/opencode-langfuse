@@ -1,11 +1,13 @@
 import { Plugin } from "@opencode/plugin"
 import { isAbsolute } from "node:path"
-import { createCapturePolicy } from "./capture-policy.js"
+import { createCapturePolicy, resolvePrivacyPreset } from "./capture-policy.js"
+import { createLangfuseCommands } from "./commands.js"
 import { MAX_STRING_LENGTH } from "./constants.js"
 import { loadConfig, maskPublicKey } from "./config.js"
 import { createLangfuseTransport } from "./langfuse.js"
 import { createPricingResolver } from "./pricing.js"
-import { redactValue } from "./redaction.js"
+import { redactHost, redactValue } from "./redaction.js"
+import { createRuntimeStatus } from "./runtime-status.js"
 import { collectSourceMetadata } from "./source-metadata.js"
 import { createTracker, type AssistantSnapshot, type SessionSnapshot, type ToolSnapshot } from "./tracker.js"
 import type { ModelReference } from "./generations.js"
@@ -267,26 +269,73 @@ export default Plugin.define({
   id: "opencode-langfuse",
   async setup(ctx) {
     const config = await loadConfig()
-    if (config.source === "none") {
-      console.log(`📊 Langfuse: Disabled — ${config.reason}`)
-      return
+    // Active configuration (ADR-0001) is resolved once: the commands report
+    // and test exactly what the tracker uses, never a freshly reread file.
+    const runtimeStatus = createRuntimeStatus()
+    const filePreset = config.source === "none" ? undefined : config.privacyPreset
+    const preset = resolvePrivacyPreset({ preset: filePreset })
+    const policy = createCapturePolicy({ preset: filePreset })
+    // Setup-local stopping flag: after unload begins, no observer may replace
+    // the retained last-error state behind closed commands.
+    let stopping = false
+    const recordError = (scope: string) => (message: string) => {
+      if (!stopping) {
+        runtimeStatus.record(scope, message)
+      }
+    }
+
+    const transport =
+      config.source === "none"
+        ? undefined
+        : createLangfuseTransport(
+            {
+              host: config.host,
+              publicKey: config.publicKey,
+              secretKey: config.secretKey,
+            },
+            { onError: recordError("ingestion") },
+          )
+
+    const commands = createLangfuseCommands({
+      config,
+      policy,
+      preset,
+      runtimeStatus,
+      transport,
+      log: (message) => console.log(`📊 Langfuse: ${message}`),
+    })
+    await ctx.command.transform((editor) => {
+      editor.add({
+        name: "langfuse-status",
+        description: "Show active Langfuse tracing status (server logs)",
+        execute: () => commands.status(),
+      })
+      editor.add({
+        name: "langfuse-test",
+        description: "Send a standalone Langfuse connectivity test trace (server logs)",
+        execute: () => commands.test(),
+      })
+    })
+
+    if (config.source === "none" || transport === undefined) {
+      const reason = config.source === "none" ? config.reason : "transport unavailable"
+      console.log(`📊 Langfuse: Disabled — ${reason}`)
+      return () => {
+        stopping = true
+        commands.close()
+      }
     }
     console.log(
-      `📊 Langfuse: Tracing enabled → ${config.host} (key ${maskPublicKey(config.publicKey)}, source ${config.source})`,
+      `📊 Langfuse: Tracing enabled → ${redactHost(config.host)} (key ${maskPublicKey(config.publicKey)}, source ${config.source})`,
     )
 
     // The unload controller must exist before tracker/collector construction:
     // source-metadata collection takes the plugin's abort signal, and the
     // event subscription below reuses the same controller.
     const controller = new AbortController()
-    const transport = createLangfuseTransport({
-      host: config.host,
-      publicKey: config.publicKey,
-      secretKey: config.secretKey,
-    })
     const tracker = createTracker({
       transport,
-      policy: createCapturePolicy({ preset: config.privacyPreset }),
+      policy,
       // One resolver for the plugin lifetime: file pricing overrides (env
       // selection never carries pricing) plus the native catalog loader. The
       // catalog is loaded lazily on the first lookup without an exact
@@ -295,6 +344,7 @@ export default Plugin.define({
         overrides: config.pricing,
         loadCatalog: () => ctx.model.list(),
       }),
+      onError: recordError("tracker"),
       lookupSession: async (sessionID) => {
         // Direct result shapes (verified by the identity preflight); no guessed
         // envelopes are ported.
@@ -317,7 +367,10 @@ export default Plugin.define({
         collectSourceMetadata(directory, {
           readVcs: (dir, signal) => ctx.vcs.get({ location: { directory: dir } }, { signal }),
           signal: controller.signal,
-          log: (message) => console.warn(`📊 Langfuse: ${message}`),
+          log: (message) => {
+            console.warn(`📊 Langfuse: ${message}`)
+            recordError("source-metadata")(message)
+          },
         }),
       lookupAssistant: async (sessionID, assistantMessageID) => {
         const context: unknown = await ctx.session.context({ sessionID })
@@ -402,6 +455,7 @@ export default Plugin.define({
           // waits on a session's state or on Langfuse.
           void tracker.handleEvent(streamed).catch((error) => {
             console.warn(`📊 Langfuse: ${String(redactValue(truncateDiagnostic(error)))}`)
+            recordError("event")(truncateDiagnostic(error))
           })
         }
       } catch (error) {
@@ -409,11 +463,14 @@ export default Plugin.define({
           // The stream is a boundary: dynamic error text passes the redactor
           // like every other emitted string, never raw.
           console.warn(`📊 Langfuse: Event stream failed: ${String(redactValue(truncateDiagnostic(error)))}`)
+          recordError("event-stream")(truncateDiagnostic(error))
         }
       }
     })()
 
     return async () => {
+      stopping = true
+      commands.close()
       controller.abort()
       await tracker.shutdown()
     }
