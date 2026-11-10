@@ -54,3 +54,4 @@ How/when we will know the decision holds (probe, test, live evidence).
 | 0002 | Usage capture & cost computation | accepted |
 | 0003 | Deterministic identity & generation acquisition | accepted |
 | 0004 | Tool observation, compaction span, and score lifecycle | accepted |
+| 0005 | Source metadata, operational commands, and child-session traces | accepted |

@@ -12,6 +12,7 @@
  */
 
 import { createHash, randomUUID } from "node:crypto"
+import { isAbsolute } from "node:path"
 import { z } from "zod"
 import { observeAuxiliaryResponse, type AuxiliaryCompletion, type ObservedAuxiliaryResponse } from "./auxiliary.js"
 import { applyCapturePolicy, type CapturePolicy } from "./capture-policy.js"
@@ -41,6 +42,7 @@ import type { IngestEvent, LangfuseTransport } from "./langfuse.js"
 import { isRecord } from "./guards.js"
 import type { PricingResolver } from "./pricing.js"
 import { redactValue } from "./redaction.js"
+import type { SourceMetadata } from "./source-metadata.js"
 import {
   buildToolEvent,
   captureHookToolInput,
@@ -250,6 +252,8 @@ const compactionFailedSchema = z.object({
 
 export interface SessionSnapshot {
   parentID?: string
+  /** The session's own working directory (nonempty absolute path only). */
+  directory?: string
   createdAt?: number
   firstPrompt?: string
   latestAssistantOutput?: string
@@ -292,6 +296,8 @@ export interface TrackerOptions {
   log?: (message: string) => void
   /** Cold-load reconciliation: children (parentID) are skipped; failure fails open. */
   lookupSession?(sessionID: string): Promise<SessionSnapshot | undefined>
+  /** Bounded collection of source facts for a session's own directory (feature-011). */
+  lookupSourceMetadata?(directory: string): Promise<SourceMetadata>
   /** Targeted recovery of one missing primary start from the transcript. */
   lookupAssistant?(sessionID: string, assistantMessageID: string): Promise<AssistantSnapshot | undefined>
   /** Targeted recovery of one missing tool name/start from the exact transcript tool part. */
@@ -373,6 +379,11 @@ interface SessionState {
   createdAt?: number
   firstPrompt?: string
   latestAssistantOutput?: string
+  /** Trustworthy session directory from native facts, once known. */
+  directory?: string
+  /** Detached sanitized source facts, collected once per admission (feature-011). */
+  sourceMetadata?: SourceMetadata
+  sourceMetadataAttempted?: boolean
   rootDirty: boolean
   rootExported: boolean
   rootEndedAt?: number
@@ -483,6 +494,13 @@ function diagnosticHostCost(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined
 }
 
+/** Nonempty absolute directory from a native birth payload only. */
+function birthDirectory(data: Record<string, unknown>): string | undefined {
+  const location = isRecord(data.location) ? data.location : undefined
+  const directory = location?.directory
+  return typeof directory === "string" && directory.length > 0 && isAbsolute(directory) ? directory : undefined
+}
+
 /** Limits + redaction applied before recovered root content is retained. */
 function boundRecovered(value: string): string {
   return truncate(value, MAX_STRING_LENGTH)
@@ -498,6 +516,7 @@ export function createTracker(options: TrackerOptions): Tracker {
   const now = options.now ?? Date.now
   const log = options.log ?? ((message: string) => console.warn(`📊 Langfuse: ${message}`))
   const lookupSession = options.lookupSession
+  const lookupSourceMetadata = options.lookupSourceMetadata
   const lookupAssistant = options.lookupAssistant
   const lookupTool = options.lookupTool
 
@@ -807,11 +826,50 @@ export function createTracker(options: TrackerOptions): Tracker {
     } else if (st.createdAt === undefined) {
       st.createdAt = eventCreated
     }
+    if (typeof snapshot?.directory === "string" && st.directory === undefined) {
+      st.directory = snapshot.directory
+    }
     if (snapshot?.firstPrompt !== undefined && st.firstPrompt === undefined) {
       st.firstPrompt = boundRecovered(snapshot.firstPrompt)
     }
     if (snapshot?.latestAssistantOutput !== undefined && st.latestAssistantOutput === undefined) {
       st.latestAssistantOutput = boundRecovered(snapshot.latestAssistantOutput)
+    }
+  }
+
+  /** Native birth facts enrich an existing state without erasing known values. */
+  function mergeBirthDirectory(st: SessionState, birth: Pick<SessionSnapshot, "directory"> | undefined): void {
+    if (st.directory === undefined && typeof birth?.directory === "string" && birth.directory.length > 0) {
+      st.directory = birth.directory
+    }
+  }
+
+  /**
+   * Lazy, once-per-admission source-metadata collection (feature-011): runs
+   * inside this session's state chain, before its next root export is
+   * scheduled; the detached sanitized result is reused on every trace upsert.
+   * A reconstructed state recollects current repository facts.
+   */
+  async function ensureSourceMetadata(st: SessionState): Promise<void> {
+    if (
+      lookupSourceMetadata === undefined ||
+      st.sourceMetadataAttempted ||
+      st.sourceMetadata !== undefined ||
+      st.directory === undefined
+    ) {
+      return
+    }
+    st.sourceMetadataAttempted = true
+    try {
+      const metadata = await lookupSourceMetadata(st.directory)
+      if (closed) {
+        return
+      }
+      st.sourceMetadata = metadata
+      st.rootDirty = true
+      requestExport(st)
+    } catch (error) {
+      diagnostic(`source metadata collection failed for session ${st.sessionID}: ${String(error)}`)
     }
   }
 
@@ -821,9 +879,12 @@ export function createTracker(options: TrackerOptions): Tracker {
     eventCreated: number,
     allowCreate: boolean,
     origin?: "session.created",
+    birth?: Pick<SessionSnapshot, "directory">,
   ): Promise<SessionState | undefined> {
     const existing = states.get(sessionID)
     if (existing) {
+      mergeBirthDirectory(existing, birth)
+      await ensureSourceMetadata(existing)
       return existing
     }
     if (excludedSessions.has(sessionID)) {
@@ -855,6 +916,7 @@ export function createTracker(options: TrackerOptions): Tracker {
     if (!st) {
       return undefined
     }
+    mergeBirthDirectory(st, birth)
     markRootRecovered(st, snapshot, eventCreated)
     if (!st.ledgerSeeded) {
       st.ledgerSeeded = true
@@ -867,6 +929,7 @@ export function createTracker(options: TrackerOptions): Tracker {
         seedScoreLedger(st, snapshot)
       }
     }
+    await ensureSourceMetadata(st)
     return st
   }
 
@@ -1734,6 +1797,17 @@ export function createTracker(options: TrackerOptions): Tracker {
 
       const rootNeedsExport = !st.rootExported || st.rootDirty
       if (rootNeedsExport) {
+        // Source metadata (feature-011) rides trace metadata only; the root
+        // observation keeps its existing metadata and child observations are
+        // never touched.
+        const traceCaptured = applyCapturePolicy(
+          {
+            input: st.firstPrompt,
+            output: st.latestAssistantOutput,
+            metadata: { ...st.sourceMetadata, sessionId: st.sessionID, completed: st.rootEndedAt !== undefined },
+          },
+          policy,
+        )
         const captured = applyCapturePolicy(
           {
             input: st.firstPrompt,
@@ -1754,16 +1828,16 @@ export function createTracker(options: TrackerOptions): Tracker {
           id: st.identity.traceId,
           name: TRACE_NAME,
           sessionId: langfuseSessionId,
-          metadata: captured.metadata,
+          metadata: traceCaptured.metadata,
         }
         if (startIso !== undefined) {
           traceBody.timestamp = startIso
         }
-        if (captured.input !== undefined) {
-          traceBody.input = captured.input
+        if (traceCaptured.input !== undefined) {
+          traceBody.input = traceCaptured.input
         }
-        if (captured.output !== undefined) {
-          traceBody.output = captured.output
+        if (traceCaptured.output !== undefined) {
+          traceBody.output = traceCaptured.output
         }
         events.push({ id: newId(), type: "trace-create", timestamp: new Date(emittedAt).toISOString(), body: traceBody })
 
@@ -2010,6 +2084,7 @@ export function createTracker(options: TrackerOptions): Tracker {
       }
       // Native session.created carries parentID directly: children never get
       // state, lookups, or generations.
+      let birth: Pick<SessionSnapshot, "directory"> | undefined
       if (type === "session.created" && isRecord(envelope.data.data)) {
         const parentID = envelope.data.data.parentID
         if (typeof parentID === "string" && parentID.length > 0) {
@@ -2022,11 +2097,13 @@ export function createTracker(options: TrackerOptions): Tracker {
           }
           return Promise.resolve()
         }
+        const dir = birthDirectory(envelope.data.data)
+        birth = dir !== undefined ? { directory: dir } : undefined
       }
       return enqueueState(sessionID, async () => {
         // The event was accepted before this task ran, so its session may still
         // be created even when shutdown began in the meantime.
-        const st = await reconcile(sessionID, created, true, type === "session.created" ? "session.created" : undefined)
+        const st = await reconcile(sessionID, created, true, type === "session.created" ? "session.created" : undefined, birth)
         if (!st || !rememberDurable(st, durable, envelopeId)) {
           return
         }

@@ -179,3 +179,21 @@ loads fine) observed real sessions against a local OpenAI-compatible mock. Raw e
   function ran on every config-dir reload (four observed), never between sessions — cleanup is
   an unload/reload hook, not a per-session boundary.
 
+### Features 011–013 pinned surfaces (type-verified 2026-11-10, installed v2.0.31)
+
+- `ctx.vcs.get({location:{directory}}, {signal?})` → `Promise<{location, data: Vcs.Info}>`;
+  `RequestOptions` carries `signal?: AbortSignal`. `Vcs.Info` has **only**
+  `provider?: string` and `branch?: {current?: string, default?: string}` — neither a remote
+  URL, a commit id, nor a work-tree root. The default branch is not HEAD.
+- `ctx.command.transform(cb: (editor: {add(definition): void}) => void): Promise<Registration>`.
+  `CommandDefinition` is `{name, description?, execute(input: CommandInvocation):
+  Promise<void>}`; `CommandInvocation` is `{sessionID, prompt, delivery}`. `execute` has **no**
+  return-text/UI channel, and native execution of a command does **not** submit its invocation
+  prompt (pinned core `command.ts`, v2.0.31) — prompting stays owned by the handler.
+- `Session.Info` (from `ctx.session.get` / `session.created` data) is per-session:
+  `location.directory` is an absolute path for the session's own location, `parentID?` is the
+  direct parent session id, `agent?` is the session's agent name. `ctx.location` is the
+  plugin-instance location and is **not** a substitute for a session's location.
+- `session.created` child births carry `parentID`, `agent`, and `title` directly in `data`
+  (R3), and children emit their own `session.step.*`/`session.execution.*` events.
+

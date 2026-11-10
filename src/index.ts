@@ -1,10 +1,12 @@
 import { Plugin } from "@opencode/plugin"
+import { isAbsolute } from "node:path"
 import { createCapturePolicy } from "./capture-policy.js"
 import { MAX_STRING_LENGTH } from "./constants.js"
 import { loadConfig, maskPublicKey } from "./config.js"
 import { createLangfuseTransport } from "./langfuse.js"
 import { createPricingResolver } from "./pricing.js"
 import { redactValue } from "./redaction.js"
+import { collectSourceMetadata } from "./source-metadata.js"
 import { createTracker, type AssistantSnapshot, type SessionSnapshot, type ToolSnapshot } from "./tracker.js"
 import type { ModelReference } from "./generations.js"
 import { isRecord } from "./guards.js"
@@ -90,7 +92,23 @@ function parseSessionSnapshot(info: unknown, context: unknown): SessionSnapshot 
   if (isRecord(time) && typeof time.created === "number" && Number.isFinite(time.created)) {
     snapshot.createdAt = time.created
   }
-  const messages = Array.isArray(context) ? context : []
+  // The session's own location (nonempty absolute only); never substituted.
+  const location = info.location
+  if (
+    isRecord(location) &&
+    typeof location.directory === "string" &&
+    location.directory.length > 0 &&
+    isAbsolute(location.directory)
+  ) {
+    snapshot.directory = location.directory
+  }
+  if (!Array.isArray(context)) {
+    // A transcript read failure is not a complete empty history; scores stay
+    // omitted while the known info still reconciles identity and directory.
+    snapshot.scoreHistory = { complete: false }
+    return snapshot
+  }
+  const messages = context
   // Score history seeding: identities and terminal outcomes only. A completed
   // compaction boundary means the window lost its prefix — incomplete, never
   // invented. Streaming-only tool parts are not admitted calls and are skipped.
@@ -257,6 +275,10 @@ export default Plugin.define({
       `📊 Langfuse: Tracing enabled → ${config.host} (key ${maskPublicKey(config.publicKey)}, source ${config.source})`,
     )
 
+    // The unload controller must exist before tracker/collector construction:
+    // source-metadata collection takes the plugin's abort signal, and the
+    // event subscription below reuses the same controller.
+    const controller = new AbortController()
     const transport = createLangfuseTransport({
       host: config.host,
       publicKey: config.publicKey,
@@ -277,9 +299,26 @@ export default Plugin.define({
         // Direct result shapes (verified by the identity preflight); no guessed
         // envelopes are ported.
         const info: unknown = await ctx.session.get({ sessionID })
-        const context: unknown = await ctx.session.context({ sessionID })
+        let context: unknown
+        try {
+          context = await ctx.session.context({ sessionID })
+        } catch (error) {
+          // A failed transcript read must not discard the known info:
+          // identity (and directory) survive with omitted scores.
+          console.warn(
+            `📊 Langfuse: ${String(
+              redactValue(truncateDiagnostic(`failed transcript context for session ${sessionID}: ${String(error)}`)),
+            )}`,
+          )
+        }
         return parseSessionSnapshot(info, context)
       },
+      lookupSourceMetadata: (directory) =>
+        collectSourceMetadata(directory, {
+          readVcs: (dir, signal) => ctx.vcs.get({ location: { directory: dir } }, { signal }),
+          signal: controller.signal,
+          log: (message) => console.warn(`📊 Langfuse: ${message}`),
+        }),
       lookupAssistant: async (sessionID, assistantMessageID) => {
         const context: unknown = await ctx.session.context({ sessionID })
         if (!Array.isArray(context)) {
@@ -307,7 +346,6 @@ export default Plugin.define({
         return undefined
       },
     })
-    const controller = new AbortController()
 
     // Read-only tool outcome hook (feature-006): awaited registration, before
     // the event subscription. handleToolAfter captures synchronously and never

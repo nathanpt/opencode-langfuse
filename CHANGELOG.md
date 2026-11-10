@@ -7,6 +7,17 @@ All notable changes to this project are documented in this file. Format based on
 
 ### Added
 
+- Source/git metadata (feature-011): each trace carries the session's repository identity —
+  `source_type`, native `git_branch` (from `ctx.vcs.get` current branch only; the default
+  branch is never substituted), `git_commit` from bounded read-only Git (40/64 hex), sanitized
+  `git_remote_host`/`git_remote_path` (scheme, userinfo, query, fragment, and `.git` never
+  leave the process), and `repo_owner`/`repo_name`/`repo_identity` from the remote path or the
+  observed `repo_root_name`. `metadata_source` distinguishes `git-detection` from `repo-file`.
+  A repository-root `.opencode-langfuse.metadata.json` (64 KiB bound, no upward search) may
+  override exactly eight documented keys; engine/trace keys cannot be overridden, unusable
+  files are ignored with one fixed diagnostic, and every retained value passes the redactor.
+  Metadata rides trace metadata only (reasserted on updates), under every privacy preset; no
+  trustworthy session directory means no fabricated source.
 - Tool observations (feature-006): one root-parented span per exact tool call, paired by the
   full `(sessionID, assistantMessageID, toolCallID)` identity with deterministic ids. Failure
   classification follows the operator-selected rule — the `execute.after` error status or a

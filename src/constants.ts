@@ -23,6 +23,12 @@ export const INGEST_TIMEOUT_MS = 10_000
 /** Rates are USD per 1,000,000 tokens; computed cost amounts are USD. */
 export const PRICE_PER_MILLION = 1_000_000
 
+/** Overall source-metadata collection deadline (feature-011). */
+export const SOURCE_METADATA_TIMEOUT_MS = 2_000
+
+/** Override-file size bound: reads must never buffer unbounded repository files. */
+export const MAX_SOURCE_METADATA_FILE_BYTES = 65_536
+
 /** Bounded cap for the final shutdown flush. */
 export const SHUTDOWN_TIMEOUT_MS = 5_000
 

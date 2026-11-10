@@ -153,10 +153,10 @@
       "description": "Source/git metadata is recorded on the trace",
       "steps": [
         "Run a session inside this git repository and fetch the newest trace",
-        "Verify trace metadata includes source_type, git_branch, git_commit, and repo identity sourced from ctx.vcs",
+        "Verify trace metadata includes source_type, git_branch (from native ctx.vcs current branch), git_commit and repo identity from the approved read-only Git supplement",
         "Verify a metadata-override file at the repo root can override/add the documented keys"
       ],
-      "passes": false,
+      "passes": true,
       "priority": 3,
       "dependencies": [
         "feature-002"
