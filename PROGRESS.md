@@ -6,8 +6,8 @@
   committed after live verification (per-feature commit policy, operator-approved 2026-11-09);
   feature-003 implemented and live-verified 2026-11-09; feature-004 implemented and
   live-verified 2026-11-09; feature-005 implemented and live-verified 2026-11-10; features
-  006–009 implemented and live-verified 2026-11-10 (uncommitted); features 011–013 implemented
-  and live-verified 2026-11-10 (this change, uncommitted, per the 006–009 precedent). The
+  006–009 implemented and live-verified 2026-11-10 (committed as 5c9864b); features 011–013
+  implemented and live-verified 2026-11-10 (committed as 8630e18, 726135a, 3938744). The
   feature list (`docs/feature-list.json`) is complete: features 001–013 all `passes: true`.
 
 ## Confirmed working surfaces
@@ -213,9 +213,10 @@
 
 ## Active work
 
-- None in flight. Features 001–013 are implemented and live-verified; the feature list
-  (`docs/feature-list.json`) is complete. Uncommitted on `master`: features 006–009 (prior
-  change) and 011–013 (this change) await the operator's per-feature commits.
+- None in flight. Features 001–013 are implemented, live-verified, and committed; the feature
+  list (`docs/feature-list.json`) is complete. Each commit's tree passes its recorded
+  verification level (006–009: 148 tests; +011: 169; +012: 185; +013: 195; typecheck and build
+  clean at every step).
 
 ## Blockers and unknowns
 
@@ -245,6 +246,6 @@
 
 ## Next useful move
 
-- The feature list is complete. Useful follow-ups outside the current contract: per-feature
-  commits for the uncommitted 006–009 and 011–013 work, the deferred distribution channel
-  decision, and the ADR-0002 tier-discriminator note.
+- The feature list is complete and the work is committed. Useful follow-ups outside the
+  current contract: the deferred distribution channel decision (npm vs git) and the ADR-0002
+  tier-discriminator note.
