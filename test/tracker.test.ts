@@ -1214,7 +1214,7 @@ test("catalog quotes export honest tier metadata", async () => {
           providerID: "mock",
           cost: [
             { input: 1.5, output: 9, cache: { read: 0.15, write: 1.25 } },
-            { input: 0.75, output: 4.5, cache: { read: 0.075, write: 0.6 }, tier: { type: "context", size: 200_000 } },
+            { input: 3, output: 18, cache: { read: 0.3, write: 2.5 }, tier: { type: "context", size: 200_000 } },
           ],
         },
       ],
@@ -1236,10 +1236,37 @@ test("catalog quotes export honest tier metadata", async () => {
   await tracker.flushAll()
   const gen = generationsOf(flatten(transport)).find((e) => e.body.name === "llm-generation")!
   assert.equal(metaOf(gen).pricingSource, "catalog")
-  assert.equal(metaOf(gen).pricingTier, 0)
+  assert.ok(!("pricingTier" in metaOf(gen)), "the retired tier-index key is gone")
   assert.equal(metaOf(gen).pricingTierCount, 2)
-  assert.equal(metaOf(gen).pricingTierApproximation, "first-tier")
-  near((gen.body.costDetails as Record<string, number>).total, 0.00011925, "tier zero carries the quote")
+  assert.equal(metaOf(gen).pricingTierApproximation, undefined, "an unexceeded valid tier is no approximation")
+  assert.equal(metaOf(gen).pricingTierType, undefined)
+  assert.equal(metaOf(gen).pricingTierSize, undefined)
+  near((gen.body.costDetails as Record<string, number>).total, 0.00011925, "below the threshold the base row carries the quote")
+
+  // Prompt context (input + cacheRead + cacheWrite) above 200k selects the
+  // threshold tier; the tier's own rates carry the quote and the metadata
+  // names the applied discriminator.
+  tracker.handleEvent(inboxPrompt("p2"))
+  tracker.handleEvent(stepStarted("msg_tier2", { seq: 5 }))
+  tracker.handleEvent(
+    ev("session.step.ended", BASE + 400, {
+      sessionID: SID,
+      assistantMessageID: "msg_tier2",
+      finish: "stop",
+      cost: 5,
+      tokens: { input: 100_000, output: 5, reasoning: 2, cache: { read: 100_001, write: 0 } },
+    }),
+  )
+  await tracker.flushAll()
+  const gen2 = generationsOf(flatten(transport))
+    .filter((e) => e.body.name === "llm-generation")
+    .find((e) => (e.body.metadata as Record<string, unknown>).assistantMessageID === "msg_tier2")!
+  assert.equal(metaOf(gen2).pricingTierType, "context")
+  assert.equal(metaOf(gen2).pricingTierSize, 200_000)
+  assert.equal(metaOf(gen2).pricingTierApproximation, undefined)
+  const cd2 = gen2.body.costDetails as Record<string, number>
+  near(cd2.input, (100_000 * 3) / 1_000_000, "the selected tier's input rate carries the quote")
+  near(cd2.cacheRead, (100_001 * 0.3) / 1_000_000, "the selected tier's cacheRead rate carries the quote")
 })
 
 test("bundled off-peak quotes export pricingAssumption metadata", async () => {

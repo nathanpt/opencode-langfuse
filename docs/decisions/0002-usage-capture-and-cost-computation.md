@@ -1,6 +1,6 @@
 # 0002. Usage capture and cost computation
 
-- Status: accepted (2026-11-09, operator approval)
+- Status: accepted (2026-11-09, operator approval); amended 2026-11-10 (catalog tier selection)
 - Date: 2026-11-09
 - Evidence: `/tmp/r1-probe/out/` (runs 1–7), `docs/references/opencode-plugin-api.md` → Runtime-verified
 
@@ -47,13 +47,21 @@ cache.write×w` (USD; reasoning priced at the output rate — host precedent), w
 per `providerID/modelID` in this precedence:
 
 1. Plugin config override (exact id) — carries over from omp-langfuse.
-2. `ctx.model.list()` catalog tier (USD/Mtok; first tier in v0).
+2. `ctx.model.list()` catalog tier (USD/Mtok). Cost rows are a tier array: the base
+   row (no `tier` field) first, then context-threshold rows. Per request, the
+   discriminator is the prompt context — `input + cacheRead + cacheWrite` — and the
+   highest exceeded `tier.size` wins; below every threshold the base row applies.
+   Semantics mirror the host's `calculateCost` (source-verified at v2.0.31,
+   `packages/core/src/session/usage.ts`); the numbers are still plugin-computed.
+   Unrecognizable tier rows (unknown discriminator type/shape or invalid rates) are
+   ignored and the base-only quote is flagged `firstTierApproximation`.
 3. Bundled table for subscription/zeroed models (sibling's researched rates, e.g. GLM).
 4. No match → cost omitted from the observation and a one-time warning emitted per model.
 
-Known limitation (v0): source 2 does not cover config-defined providers (verified gap), so those
-resolve via 1 or 4 only until a config-read surface is available. Multi-tier pricing
-(`context_over_200k`) has an unverified tier discriminator; v0 uses the first tier and flags it.
+Known limitation: source 2 does not cover config-defined providers (verified gap), so those
+resolve via 1 or 4 only until a config-read surface is available. (The v0 tier limitation —
+first tier quoted, discriminator unverified — was resolved 2026-11-10: see Decision item 2
+and Confirmation.)
 
 ## Consequences
 
@@ -65,4 +73,9 @@ resolve via 1 or 4 only until a config-read surface is available. Multi-tier pri
 
 E2E audit on a priced model: fetch the newest trace and assert `costDetails` equal the
 hand-computed value from the resolved tier within float tolerance, including a cache-heavy run;
-compare against the host's `cost` field to document the delta.
+compare against the host's `cost` field to document the delta. Feature-005 executed this gate
+live (2026-11-10). Tier selection (amendment 2026-11-10): the native catalog's `tier`
+discriminator (`{type: "context", size}`) was verified at source level (`models-dev.ts`
+normalization retains the field on `Model.Info.cost`) and against a live Langfuse through the
+tier harness — base/tier1/tier2/boundary cases against real models.dev rates (qiniu-ai two-tier
+row), with cache terms driving the discriminator across a threshold.

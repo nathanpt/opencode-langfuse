@@ -36,8 +36,9 @@ cache {read, write}}`; units USD/Mtok; host cost `0.0001185` = `37×1.5 + 5×9 +
 
 **Decision:** layered price resolution (config override → model.list tier → bundled table → omit
 + warn); cost always self-computed including cache terms and reasoning-at-output-rate.
-Recorded as **ADR-0002 (proposed)**. Open sub-question: the tier discriminator for
-context-threshold pricing (`context_over_200k`) — v0 uses the first tier.
+Recorded as **ADR-0002 (proposed)**. The tier-discriminator sub-question was resolved
+2026-11-10 (ADR-0002 amendment): context-threshold tiers select by
+`input + cacheRead + cacheWrite` against `tier.size` — see ADR-0002 Decision item 2.
 
 - Acceptance: met — decision recorded; ADR-0002 drafted.
 

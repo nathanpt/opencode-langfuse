@@ -8,7 +8,10 @@
  *
  *   1. config override, exact `${providerID}/${model.id}` key (explicit zeros
  *      are valid prices, not gaps)
- *   2. native model catalog, `(providerID, id)` match, first cost tier only
+ *   2. native model catalog, `(providerID, id)` match; the cost tier is
+ *      selected per request by context threshold — the discriminator is
+ *      `input + cacheRead + cacheWrite`, the highest exceeded `context.size`
+ *      wins, below every threshold the base row applies (host semantics)
  *   3. bundled table, lowercased full model id
  *   4. no match → cost omitted, one warning per model per resolver lifetime
  *
@@ -46,11 +49,26 @@ export interface CostBreakdown {
   readonly total: number
 }
 
+/**
+ * A catalog cost tier discriminated by a context-size threshold: its rates
+ * apply when the request's prompt context (`input + cacheRead + cacheWrite`
+ * tokens) exceeds `size`. Only the "context" type exists in the native
+ * catalog (v2.0.31 `models-dev.ts`); selection mirrors host
+ * `session/usage.ts calculateCost` — source-verified, not host-computed.
+ */
+export interface ContextTier {
+  readonly type: "context"
+  readonly size: number
+}
+
 /** An immutable quote computed once per request from one resolved source. */
 export interface GenerationPricing {
   readonly costDetails: CostBreakdown
   readonly source: "config" | "catalog" | "bundled"
   readonly tierCount?: number
+  /** The selected context tier; absent when the base row is quoted. */
+  readonly pricingTier?: ContextTier
+  /** Tier rows existed but none could be honored; the base row was quoted. */
   readonly firstTierApproximation?: true
   readonly assumption?: "off-peak"
 }
@@ -205,25 +223,60 @@ const BUNDLED_EXACT: Record<string, BundledEntry> = {
   "o4-mini": { price: bundled(1.1, 4.4, 0.55) },
 }
 
+interface CatalogTier {
+  readonly price: TokenPrice
+  readonly tier: ContextTier
+}
+
 interface CatalogQuote {
-  price: TokenPrice
-  tierCount: number
-  firstTierApproximation?: true
+  /** The undiscriminated row (`tier` absent); all four rates finite. */
+  readonly base: TokenPrice
+  /** Valid context-threshold rows in catalog order. */
+  readonly tiers: readonly CatalogTier[]
+  /** Tier rows present but unusable (unknown discriminator or invalid rates). */
+  readonly unrecognizedTiers?: true
+  readonly tierCount: number
 }
 
 function isAllZero(price: TokenPrice): boolean {
   return price.input === 0 && price.output === 0 && price.cacheRead === 0 && price.cacheWrite === 0
 }
 
+function samePrice(a: TokenPrice, b: TokenPrice): boolean {
+  return (
+    a.input === b.input &&
+    a.output === b.output &&
+    a.cacheRead === b.cacheRead &&
+    a.cacheWrite === b.cacheWrite
+  )
+}
+
 function sameQuote(a: CatalogQuote, b: CatalogQuote): boolean {
   return (
-    a.price.input === b.price.input &&
-    a.price.output === b.price.output &&
-    a.price.cacheRead === b.price.cacheRead &&
-    a.price.cacheWrite === b.price.cacheWrite &&
+    samePrice(a.base, b.base) &&
     a.tierCount === b.tierCount &&
-    a.firstTierApproximation === b.firstTierApproximation
+    a.unrecognizedTiers === b.unrecognizedTiers &&
+    a.tiers.length === b.tiers.length &&
+    a.tiers.every(
+      (tier, index) =>
+        tier.tier.type === b.tiers[index].tier.type &&
+        tier.tier.size === b.tiers[index].tier.size &&
+        samePrice(tier.price, b.tiers[index].price),
+    )
   )
+}
+
+/** All four rates finite and nonnegative; anything else is unusable. */
+function rowPrice(row: Record<string, unknown>): TokenPrice | undefined {
+  const cache = isRecord(row.cache) ? row.cache : undefined
+  const input = row.input
+  const output = row.output
+  const cacheRead = cache?.read
+  const cacheWrite = cache?.write
+  if (!isRate(input) || !isRate(output) || !isRate(cacheRead) || !isRate(cacheWrite)) {
+    return undefined
+  }
+  return { input, output, cacheRead, cacheWrite }
 }
 
 /**
@@ -233,6 +286,11 @@ function sameQuote(a: CatalogQuote, b: CatalogQuote): boolean {
  * substitutes for `id`. Malformed rows are skipped; identical duplicates
  * collapse; conflicting duplicates make that identity unusable. Returns
  * undefined for a malformed envelope.
+ *
+ * Each cost array splits into the base row (first entry without a `tier`
+ * discriminator) and context-threshold tier rows; tier rows with an unknown
+ * discriminator or invalid rates set `unrecognizedTiers`, which later flags
+ * the base-only quote as `firstTierApproximation`.
  */
 function parseCatalog(raw: unknown): Map<string, CatalogQuote> | undefined {
   if (!isRecord(raw) || !Array.isArray(raw.data)) {
@@ -251,18 +309,40 @@ function parseCatalog(raw: unknown): Map<string, CatalogQuote> | undefined {
     if (!Array.isArray(cost) || cost.length === 0) {
       continue
     }
-    const tier = cost[0]
-    if (!isRecord(tier)) {
-      continue
+    // Split the tier array: the base row is the first entry without a `tier`
+    // discriminator (host `calculateCost` reads it the same way); every other
+    // entry is a threshold-tier candidate. All four rates on the base must be
+    // finite and nonnegative — anything else is a miss, and a later tier
+    // never hides an invalid or missing base.
+    let sawBase = false
+    let base: TokenPrice | undefined
+    const tiers: CatalogTier[] = []
+    let unrecognized = false
+    for (const entry of cost) {
+      if (!isRecord(entry)) {
+        unrecognized = true
+        continue
+      }
+      if (entry.tier === undefined) {
+        // The first base-shaped row is the base — a later one never rescues
+        // an invalid first (host `find` takes the first too).
+        if (!sawBase) {
+          sawBase = true
+          base = rowPrice(entry)
+        }
+        continue
+      }
+      const discriminator = isRecord(entry.tier) ? entry.tier : undefined
+      const price = rowPrice(entry)
+      if (price !== undefined && discriminator?.type === "context" && isRate(discriminator.size)) {
+        tiers.push({ price, tier: { type: "context", size: discriminator.size } })
+      } else {
+        // Unrecognizable discriminator or invalid rates: the tier cannot be
+        // honored, so quoting the base is an approximation and is flagged.
+        unrecognized = true
+      }
     }
-    const cache = isRecord(tier.cache) ? tier.cache : undefined
-    const input = tier.input
-    const output = tier.output
-    const cacheRead = cache?.read
-    const cacheWrite = cache?.write
-    // All four first-tier rates must be finite and nonnegative; anything else
-    // is a miss — a later tier never hides an invalid first one.
-    if (!isRate(input) || !isRate(output) || !isRate(cacheRead) || !isRate(cacheWrite)) {
+    if (base === undefined) {
       continue
     }
     const key = `${providerID}/${id}`
@@ -270,11 +350,10 @@ function parseCatalog(raw: unknown): Map<string, CatalogQuote> | undefined {
       continue
     }
     const quote: CatalogQuote = {
-      price: { input, output, cacheRead, cacheWrite },
+      base,
+      tiers,
       tierCount: cost.length,
-      // Multi-tier or context-conditional pricing: tier zero is used and the
-      // approximation is flagged — no threshold inference.
-      ...(cost.length > 1 || tier.tier !== undefined ? { firstTierApproximation: true as const } : {}),
+      ...(unrecognized ? { unrecognizedTiers: true as const } : {}),
     }
     const existing = quotes.get(key)
     if (existing !== undefined) {
@@ -361,7 +440,7 @@ export function createPricingResolver(options: PricingOptions): PricingResolver 
     usage: GenerationUsage,
     price: TokenPrice,
     source: GenerationPricing["source"],
-    extras?: Partial<Pick<GenerationPricing, "tierCount" | "firstTierApproximation" | "assumption">>,
+    extras?: Partial<Pick<GenerationPricing, "tierCount" | "pricingTier" | "firstTierApproximation" | "assumption">>,
   ): GenerationPricing | undefined {
     // The selected source is indivisible: a missing rate for positive usage
     // omits everything rather than mixing in another source or substituting.
@@ -392,14 +471,29 @@ export function createPricingResolver(options: PricingOptions): PricingResolver 
     if (override !== undefined) {
       return quote(key, usage, override, "config")
     }
-    // 2. Native catalog, matched by (providerID, id); first tier only. An
-    //    all-zero tier is unpriced and falls through to bundled/omission.
+    // 2. Native catalog, matched by (providerID, id). The cost tier is
+    //    selected per request: prompt context (input + cacheRead + cacheWrite)
+    //    above a threshold tier's `size` uses that tier's rates — the highest
+    //    exceeded threshold wins; below every threshold the base row applies
+    //    (host calculateCost semantics, v2.0.31). An all-zero base is
+    //    unpriced and falls through to bundled/omission.
     const catalog = await catalogFor()
     const catalogQuote = catalog.get(key)
-    if (catalogQuote !== undefined && !isAllZero(catalogQuote.price)) {
-      return quote(key, usage, catalogQuote.price, "catalog", {
+    if (catalogQuote !== undefined && !isAllZero(catalogQuote.base)) {
+      const context = usage.input + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0)
+      let selected: CatalogTier | undefined
+      for (const candidate of catalogQuote.tiers) {
+        if (
+          context > candidate.tier.size &&
+          (selected === undefined || candidate.tier.size > selected.tier.size)
+        ) {
+          selected = candidate
+        }
+      }
+      return quote(key, usage, selected === undefined ? catalogQuote.base : selected.price, "catalog", {
         tierCount: catalogQuote.tierCount,
-        ...(catalogQuote.firstTierApproximation ? { firstTierApproximation: true } : {}),
+        ...(selected !== undefined ? { pricingTier: selected.tier } : {}),
+        ...(catalogQuote.unrecognizedTiers ? { firstTierApproximation: true } : {}),
       })
     }
     // 3. Bundled table, lowercased full model id (provider ignored here —

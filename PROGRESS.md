@@ -9,6 +9,8 @@
   006–009 implemented and live-verified 2026-11-10 (committed as 5c9864b); features 011–013
   implemented and live-verified 2026-11-10 (committed as 8630e18, 726135a, 3938744). The
   feature list (`docs/feature-list.json`) is complete: features 001–013 all `passes: true`.
+  Out-of-contract maintenance 2026-11-10 (UNCOMMITTED): catalog tier selection implemented and
+  live-verified (ADR-0002 amendment) — the deferred tier-discriminator item is closed.
 
 ## Confirmed working surfaces
 
@@ -174,19 +176,44 @@
   1/3/1/0/1), parent observations/scores unchanged. The cold-restore seed now applies the
   ADR-0004 rule to recovered shell exits (regression test added after the live gate caught a
   completed exit-7 shell seeding as a success).
-- Verification harness: `/tmp/oc-features011-013` (`node harness.mjs
-  <source|commands|children>`): mock OpenAI-compatible provider + Langfuse forwarding recorder
-  (scratch-only reject switch `POST /fixture/ingestion-mode`) on 127.0.0.1:18127, foreground
-  `opencode serve` on 127.0.0.1:14107, per-case temporary homes with 0600 plugin configs
-  forwarding to the approved real Langfuse, built plugin under `.opencode/plugins/`, scalar
-  evidence plugin (birth/parent/agent/directory/VCS/step/tool/execution identity; a cold-load
-  race means `session.created` can predate a plugin's subscription, so the evidence VCS read
-  keys on the first observed event and reads the directory from `session.get`). The earlier
-  harnesses remain: `/tmp/oc-features006-009` (port 18126), `/tmp/oc-feature005` (18125),
-  `/tmp/oc-feature003` (18123), `/tmp/oc-verify` (8123), `/tmp/r1-probe`.
+- **tier selection (passing, live-verified 2026-11-10, harness `/tmp/oc-tier-probe`):** the
+  ADR-0002 v0 limitation (first tier quoted, discriminator unverified) is resolved. Native
+  catalog cost arrays carry the `tier: {type: "context", size}` discriminator on all rows but
+  the base (runtime-probed via `ctx.model.list()`: `qiniu-ai/doubao-seed-2.0-lite` — base +
+  tiers at 32000/128000 with per-tier cacheRead rates). The plugin selects per request:
+  discriminator = prompt context (`input + cacheRead + cacheWrite`), highest exceeded `size`
+  wins, strict `>` boundary, else the base row — mirroring the host's `calculateCost`
+  (source-verified at v2.0.31 `packages/core/src/session/usage.ts`; the host's own tier
+  arithmetic has open bugs #44224/#42910, ours is computed independently). Unrecognizable tier
+  rows (unknown discriminator or invalid rates) degrade to the base and flag
+  `firstTierApproximation`; a tier array with no base row is a catalog miss. Generation
+  metadata: `pricingTier: 0` retired in favor of `pricingTierType`/`pricingTierSize` on the
+  applied tier; `pricingTierCount` kept; approximation flag only for unhonorable tier rows.
+  Live gate through the forwarding mock (scratch-only usage fixture on `POST /fixture/usage`)
+  with a registry provider (`QINIU_API_KEY=dummy`) and `options.baseURL` → local mock, real
+  Langfuse upstream: base (4200), cache-driven crossing (input 5000 + cacheRead 35000 → 32k
+  tier — the exact composition the host mishandles per #44224), 128k tier (130000), boundary
+  (32000 exactly → base). All 4 batches accepted upstream (201 per event) and case B's stored
+  generation read back from the real Langfuse matching the tier math exactly
+  (`costDetails.total 0.00157069576`, `pricingTierSize 32000`). 197/197 deterministic tests;
+  typecheck/build clean.
+- Verification harness: `/tmp/oc-tier-probe` (mock OpenAI-compatible provider + Langfuse
+  forwarding recorder with a scratch-only usage fixture switch on port 18129, gate script
+  `gate-check.mjs`; the tier-probe plugin dumps `ctx.model.list()` cost rows at instance
+  load). The earlier harnesses remain: `/tmp/oc-features011-013` (port 18127),
+  `/tmp/oc-features006-009` (18126), `/tmp/oc-feature005` (18125), `/tmp/oc-feature003`
+  (18123), `/tmp/oc-verify` (8123), `/tmp/r1-probe`.
 
 ## Operational findings worth remembering
 
+- **Plugin/plugin surface lessons from the tier gate (2026-11-10):** plugins must be
+  `export default Plugin.define({...})` — a named export never loads. Plugin instances load
+  lazily on the first session request, not at bare `opencode serve` boot. `console.log` from a
+  plugin does not reach `opencode run` client stdout — file-dump probes only. `ctx.model.list()`
+  gates on credential availability: `options.apiKey` alone does not enable a registry provider's
+  models; the provider's `env` var does. A persistent session shell keeps exported env vars
+  across tool calls — `OPENCODE_PASSWORD` leaks into later `opencode serve` boots silently
+  (env-provided passwords are adopted without printing).
 - **Preflight identity proof (feature-003 gate):** cross-hook `Request` identity
   (`http.request` → `http.response`) held for every admitted exchange on 2.0.31, including two
   concurrent same-kind `generate` calls interleaved with compaction — no FIFO/heuristic matching
@@ -213,18 +240,16 @@
 
 ## Active work
 
-- None in flight. Features 001–013 are implemented, live-verified, and committed; the feature
-  list (`docs/feature-list.json`) is complete. Each commit's tree passes its recorded
-  verification level (006–009: 148 tests; +011: 169; +012: 185; +013: 195; typecheck and build
-  clean at every step).
+- Tier selection implemented and live-verified 2026-11-10 but **uncommitted** (edits to
+  `src/pricing.ts`, `src/generations.ts`, `test/pricing.test.ts`, `test/tracker.test.ts`, plus
+  ADR-0002 amendment, API-reference/R2 + reuse-inventory notes, exec-plan R2 resolution note,
+  CHANGELOG entry). Deterministic suite 197/197 at this tree. Commit on operator request.
 
 ## Blockers and unknowns
 
-- None blocking. Open items: tier discriminator for context-threshold pricing (ADR-0002 note —
-  v0 quotes tier zero and flags `firstTierApproximation`); distribution channel (npm vs git)
-  deferred to first release — `dist/` is gitignored meanwhile. `GET /api/command` not listing
-  plugin-registered commands is a v2.0.31 native behavior (recorded in the API reference), not
-  a plugin defect.
+- None blocking. Open items: distribution channel (npm vs git) deferred to first release —
+  `dist/` is gitignored meanwhile. `GET /api/command` not listing plugin-registered commands is
+  a v2.0.31 native behavior (recorded in the API reference), not a plugin defect.
 
 ## Verification status
 
@@ -241,11 +266,12 @@
 - feature-011: passing (live evidence above, 2026-11-10; ADR-0005).
 - feature-012: passing (live evidence above, 2026-11-10; ADR-0005).
 - feature-013: passing (live evidence above, 2026-11-10; ADR-0005).
-- Deterministic suite: `npm run typecheck` clean, `npm test` 195/195 green, `npm run build`
+- tier selection: passing (live evidence above, 2026-11-10; ADR-0002 amendment).
+- Deterministic suite: `npm run typecheck` clean, `npm test` 197/197 green, `npm run build`
   produces `dist/index.js` (self-contained esbuild node22 bundle).
 
 ## Next useful move
 
-- The feature list is complete and the work is committed. Useful follow-ups outside the
-  current contract: the deferred distribution channel decision (npm vs git) and the ADR-0002
-  tier-discriminator note.
+- The feature list is complete; the tier-discriminator item is closed (ADR-0002 amendment,
+  live-verified, uncommitted). Remaining operator-driven follow-up: the distribution channel
+  decision (npm vs git), then first-release chores (version, CHANGELOG dates, README).

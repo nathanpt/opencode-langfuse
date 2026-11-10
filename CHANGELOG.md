@@ -138,6 +138,15 @@ All notable changes to this project are documented in this file. Format based on
 
 ### Changed
 
+- Catalog-priced generations now select the cost tier by context threshold instead of always
+  quoting tier 0: the discriminator is the prompt context (`input + cacheRead + cacheWrite`),
+  and the highest exceeded `context.size` in the native catalog applies (host-verified
+  semantics). Below every threshold the base row is quoted exactly — no more blanket
+  `pricingTierApproximation` flag for multi-tier models. Generation metadata replaces the
+  `pricingTier: 0` index with `pricingTierType`/`pricingTierSize` for the applied tier; the
+  approximation flag now appears only when unrecognized tier rows force a base-only quote.
+  Live-verified against the real Langfuse with a two-tier catalog model
+  (base/32k/128k/boundary + cache-driven crossing; ADR-0002 amendment 2026-11-10).
 - Session records are no longer deleted on flush; `flushNow`/`flushAll` submit detached snapshots
   and later changes export in ordered follow-up batches (`trace-create` upserts, `span-update`,
   `generation-update`).

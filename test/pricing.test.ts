@@ -452,31 +452,136 @@ test("bundled GLM rates and DeepSeek off-peak attribution", async () => {
   assert.equal(omissionWarnings(logs).length, 0)
 })
 
-test("catalog tier metadata is honest about approximations", async () => {
-  const multi = makeResolver({
+test("catalog tier selection follows the context threshold exactly", async () => {
+  // Real models.dev tier shape (qiniu-ai/qwen3-coder-480b-a35b-instruct):
+  // base row first, then context-threshold tiers at 32k and 128k.
+  const twoTier = makeResolver({
     loadCatalog: async () => ({
-      data: [catalogRow("multi", "mock", [tier(1, 2), tier(0.5, 1, 0, 0, { tier: { type: "context", size: 200_000 } })])],
+      data: [
+        catalogRow("multi", "mock", [
+          tier(0.86956522, 3.47826087),
+          tier(1.30434783, 5.2173913, 0, 0, { tier: { type: "context", size: 32_000 } }),
+          tier(2.17391304, 8.69565217, 0, 0, { tier: { type: "context", size: 128_000 } }),
+        ]),
+      ],
     }),
   })
-  const multiQuote = await multi.price({ providerID: "mock", id: "multi" }, USAGE)
-  assert.ok(multiQuote)
-  assert.equal(multiQuote.tierCount, 2, "the raw tier count is preserved")
-  assert.equal(multiQuote.firstTierApproximation, true)
-  near(multiQuote.costDetails.input, 37 / 1_000_000, "tier zero is the quote source")
 
-  const conditional = makeResolver({
+  const low = await twoTier.price(
+    { providerID: "mock", id: "multi" },
+    { input: 4_200, output: 7, reasoning: 2, cacheRead: 0, cacheWrite: 0 },
+  )
+  assert.ok(low)
+  assert.equal(low.tierCount, 3)
+  assert.equal(low.pricingTier, undefined, "below every threshold the base row is the exact quote")
+  assert.equal(low.firstTierApproximation, undefined)
+  near(low.costDetails.input, (4_200 * 0.86956522) / 1_000_000)
+
+  // The discriminator is input + cacheRead + cacheWrite, so cache traffic
+  // alone can cross the threshold (5_000 + 35_000 = 40_000 → 32k tier).
+  const viaCache = await twoTier.price(
+    { providerID: "mock", id: "multi" },
+    { input: 5_000, output: 7, reasoning: 2, cacheRead: 35_000, cacheWrite: 0 },
+  )
+  assert.ok(viaCache)
+  assert.deepEqual(viaCache.pricingTier, { type: "context", size: 32_000 })
+  near(viaCache.costDetails.input, (5_000 * 1.30434783) / 1_000_000)
+  near(viaCache.costDetails.cacheRead, 0, "cache rate stays the tier's own zero")
+
+  // The highest exceeded threshold wins.
+  const high = await twoTier.price(
+    { providerID: "mock", id: "multi" },
+    { input: 130_000, output: 7, reasoning: 2, cacheRead: 0, cacheWrite: 0 },
+  )
+  assert.ok(high)
+  assert.deepEqual(high.pricingTier, { type: "context", size: 128_000 })
+  near(high.costDetails.input, (130_000 * 2.17391304) / 1_000_000)
+
+  // The boundary is strict: context equal to the size stays on the lower tier.
+  const exact = await twoTier.price(
+    { providerID: "mock", id: "multi" },
+    { input: 32_000, output: 7, reasoning: 2, cacheRead: 0, cacheWrite: 0 },
+  )
+  assert.ok(exact)
+  assert.equal(exact.pricingTier, undefined)
+  near(exact.costDetails.input, (32_000 * 0.86956522) / 1_000_000)
+
+  // Catalog order must not matter: a reversed tier list selects identically.
+  const reversed = makeResolver({
     loadCatalog: async () => ({
-      data: [catalogRow("conditional", "mock", [tier(1, 2, 0, 0, { tier: { type: "context", size: 200_000 } })])],
+      data: [
+        catalogRow("multi", "mock", [
+          tier(0.86956522, 3.47826087),
+          tier(2.17391304, 8.69565217, 0, 0, { tier: { type: "context", size: 128_000 } }),
+          tier(1.30434783, 5.2173913, 0, 0, { tier: { type: "context", size: 32_000 } }),
+        ]),
+      ],
     }),
   })
-  const conditionalQuote = await conditional.price({ providerID: "mock", id: "conditional" }, USAGE)
-  assert.ok(conditionalQuote)
-  assert.equal(conditionalQuote.tierCount, 1)
-  assert.equal(conditionalQuote.firstTierApproximation, true, "a context-conditional first tier is flagged")
+  const fromReversed = await reversed.price(
+    { providerID: "mock", id: "multi" },
+    { input: 40_000, output: 7, reasoning: 2, cacheRead: 0, cacheWrite: 0 },
+  )
+  assert.ok(fromReversed)
+  assert.deepEqual(fromReversed.pricingTier, { type: "context", size: 32_000 })
+})
+
+test("unrecognizable tier rows degrade to the base and flag the approximation", async () => {
+  const unknownDiscriminator = makeResolver({
+    loadCatalog: async () => ({
+      data: [
+        catalogRow("unknown", "mock", [
+          tier(1, 2),
+          tier(4, 8, 0, 0, { tier: { type: "offpeak", size: 1000 } }),
+        ]),
+      ],
+    }),
+  })
+  const uq = await unknownDiscriminator.price({ providerID: "mock", id: "unknown" }, USAGE)
+  assert.ok(uq)
+  assert.equal(uq.tierCount, 2)
+  assert.equal(uq.pricingTier, undefined)
+  assert.equal(uq.firstTierApproximation, true, "an unhonorable tier row makes the base quote an approximation")
+  near(uq.costDetails.input, 37 / 1_000_000)
+
+  const malformedTiers = makeResolver({
+    loadCatalog: async () => ({
+      data: [
+        catalogRow("string-tier", "mock", [tier(1, 2), { input: 3, output: 6, cache: { read: 0, write: 0 }, tier: "context_over_200k" }]),
+        catalogRow("bad-size", "mock", [tier(1, 2), tier(3, 6, 0, 0, { tier: { type: "context", size: "lots" } })]),
+        catalogRow("bad-rates", "mock", [tier(1, 2), tier(-3, 6, 0, 0, { tier: { type: "context", size: 1000 } })]),
+        catalogRow("null-tier", "mock", [tier(1, 2), { input: 3, output: 6, cache: { read: 0, write: 0 }, tier: null }]),
+      ],
+    }),
+  })
+  for (const id of ["string-tier", "bad-size", "bad-rates", "null-tier"]) {
+    const q = await malformedTiers.price({ providerID: "mock", id }, USAGE)
+    assert.ok(q, `${id} still quotes`)
+    assert.equal(q.source, "catalog")
+    assert.equal(q.pricingTier, undefined, `${id}: no tier selected`)
+    assert.equal(q.firstTierApproximation, true, `${id}: base quote flagged`)
+    near(q.costDetails.input, 37 / 1_000_000, `${id}: base carries the quote`)
+  }
+})
+
+test("a tier array with no base row is a catalog miss", async () => {
+  const logs: string[] = []
+  const noBase = makeResolver(
+    {
+      loadCatalog: async () => ({
+        data: [catalogRow("conditional", "mock", [tier(1, 2, 0, 0, { tier: { type: "context", size: 200_000 } })])],
+      }),
+    },
+    logs,
+  )
+  const q = await noBase.price({ providerID: "mock", id: "conditional" }, USAGE)
+  assert.equal(q, undefined, "without an undiscriminated row the model is unpriced")
+  assert.equal(omissionWarnings(logs).length, 1)
 
   const single = makeResolver({ loadCatalog: async () => ({ data: [catalogRow("single", "mock", [tier(1, 2)])] }) })
   const singleQuote = await single.price({ providerID: "mock", id: "single" }, USAGE)
   assert.ok(singleQuote)
   assert.equal(singleQuote.tierCount, 1)
   assert.equal(singleQuote.firstTierApproximation, undefined)
+  assert.equal(singleQuote.pricingTier, undefined)
 })

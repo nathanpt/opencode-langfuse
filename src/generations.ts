@@ -148,9 +148,12 @@ export function buildGenerationEvent(
   if (record.pricing !== undefined) {
     metadata.pricingSource = record.pricing.source
     if (record.pricing.source === "catalog") {
-      metadata.pricingTier = 0
       if (record.pricing.tierCount !== undefined) {
         metadata.pricingTierCount = record.pricing.tierCount
+      }
+      if (record.pricing.pricingTier !== undefined) {
+        metadata.pricingTierType = record.pricing.pricingTier.type
+        metadata.pricingTierSize = record.pricing.pricingTier.size
       }
       if (record.pricing.firstTierApproximation) {
         metadata.pricingTierApproximation = "first-tier"

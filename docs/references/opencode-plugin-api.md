@@ -149,6 +149,19 @@ loads fine) observed real sessions against a local OpenAI-compatible mock. Raw e
 - `cost` is a **tier array**: `[{input, output, cache: {read, write}}]` — config's flattened
   `cache_read/cache_write` normalize into `cache.*`. All 12 listed models (built-in `opencode`
   free provider) carry `cost: [{input: 0, output: 0, cache: {read: 0, write: 0}}]`.
+  **Tier discriminator (runtime-probed 2026-11-10, v2.0.31):** rows keep `tier:
+  {type: "context", size}` from the models.dev catalog — base row first (no `tier` field),
+  then threshold rows (`doubao-seed-2.0-lite`: tiers at 32000/128000 with per-tier cacheRead
+  rates). Selection semantics live in the host's `packages/core/src/session/usage.ts
+  calculateCost`: discriminator = `input + cacheRead + cacheWrite`, highest exceeded `size`
+  wins, strict `>`. The host applies it (its own tier arithmetic has open bugs — #44224,
+  #42910); the plugin mirrors the rule and computes independently.
+- **Listing is availability-gated:** `ctx.model.list()` returns enabled models only — built-in
+  free provider always; registry providers require a credential (env var per the provider's
+  `env` field; `options.apiKey` alone is NOT enough). Config-defined providers' models never
+  appear. The `opencode models` CLI lists the full catalog regardless — it is not the plugin
+  surface. A registry provider + env key + `options.baseURL` override is the zero-spend path
+  to exercising catalog-priced models against a local mock.
 - Units: **USD per 1M tokens** — confirmed by reproducing the host cost arithmetic exactly
   (mock model priced 1.5/9/0.15/1.25; tokens 37/5/2/5 → host cost `0.0001185`).
 - Host cost formula (observed): `input×in + output×out + reasoning×out`; **`cache.read` is
