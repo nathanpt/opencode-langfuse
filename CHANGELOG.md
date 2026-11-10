@@ -1,9 +1,9 @@
 # Changelog
 
 All notable changes to this project are documented in this file. Format based on
-[Keep a Changelog](https://keepachangelog.com); versioning: SemVer. No release has shipped yet.
+[Keep a Changelog](https://keepachangelog.com); versioning: SemVer.
 
-## Unreleased
+## 0.0.1 - 2026-11-10
 
 ### Added
 
