@@ -52,3 +52,4 @@ How/when we will know the decision holds (probe, test, live evidence).
 | --- | --- | --- |
 | 0001 | Config & credential storage | accepted |
 | 0002 | Usage capture & cost computation | accepted |
+| 0003 | Deterministic identity & generation acquisition | accepted |

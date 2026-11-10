@@ -35,7 +35,7 @@
         "Verify the trace contains one generation per primary agent-loop model request with the true model id",
         "Verify auxiliary requests (title/compaction/generate kinds) are either separate tagged generations or recorded as metadata, never silently merged into primary generations"
       ],
-      "passes": false,
+      "passes": true,
       "priority": 1,
       "dependencies": ["feature-002"]
     },

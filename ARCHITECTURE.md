@@ -1,8 +1,9 @@
 # ARCHITECTURE.md — opencode-langfuse
 
-Status: research/design phase. Facts are verified against the OpenCode v2 plugin docs (fetched
+Status: implementation phase. Facts are verified against the OpenCode v2 plugin docs (fetched
 2026-11-09, against installed opencode v2.0.31) and a read of the sibling `omp-langfuse` v0.4.0
-source. Items marked **UNKNOWN** are open design work; see docs/exec-plans/active/.
+source. Features 001/002/003/010 are implemented and live-verified (see PROGRESS.md);
+remaining features and items marked **UNKNOWN** are open work; see docs/feature-list.json.
 
 ## What this system is
 
@@ -56,6 +57,12 @@ requests (compaction, title, generate) recorded and tagged by `kind` (sibling pr
 role tagging); tool observations with `level=ERROR` on failure; a span for compaction; trace-level
 scores (`tool_call_count`, `turn_count`, `total_tool_errors`, `tool_success_rate`,
 `session_had_errors`) attached when the session ends.
+
+Implemented so far: the trace/root with **deterministic identity** derived from the session id
+(ADR-0003), one generation per primary request acquired from durable `session.step.*` identity,
+and tagged auxiliary generations acquired from `http.request`/`http.response` via exact
+`Request` identity (demand-driven body observer, full-completion timing). Still to come: token
+usage (004), self-computed cost (005), compaction spans (007), scores (009), child traces (013).
 
 ## Design decisions (all five resolved 2026-11-09)
 

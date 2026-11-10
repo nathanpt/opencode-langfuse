@@ -28,8 +28,13 @@ export interface IngestResult {
   failed: number
 }
 
+export interface IngestOptions {
+  /** External cancellation (shutdown deadline); stops retrying immediately. */
+  signal?: AbortSignal
+}
+
 export interface LangfuseTransport {
-  ingest(events: IngestEvent[]): Promise<IngestResult>
+  ingest(events: IngestEvent[], options?: IngestOptions): Promise<IngestResult>
 }
 
 export interface TransportOptions {
@@ -52,7 +57,9 @@ export function createLangfuseTransport(config: LangfuseEndpointConfig, options:
   const log = options.log ?? ((message: string) => console.warn(`📊 Langfuse: ${message}`))
   const authorization = `Basic ${Buffer.from(`${config.publicKey}:${config.secretKey}`).toString("base64")}`
 
-  async function attempt(events: IngestEvent[]): Promise<IngestResult> {
+  async function attempt(events: IngestEvent[], signal: AbortSignal | undefined): Promise<IngestResult> {
+    const timeout = AbortSignal.timeout(timeoutMs)
+    const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
     const response = await fetchImpl(`${config.host}/api/public/ingestion`, {
       method: "POST",
       headers: {
@@ -63,7 +70,7 @@ export function createLangfuseTransport(config: LangfuseEndpointConfig, options:
         metadata: { sdk_name: "opencode-langfuse" },
         batch: events,
       }),
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: combined,
     })
 
     if (!response.ok) {
@@ -81,17 +88,23 @@ export function createLangfuseTransport(config: LangfuseEndpointConfig, options:
   }
 
   return {
-    async ingest(events: IngestEvent[]): Promise<IngestResult> {
+    async ingest(events: IngestEvent[], options?: IngestOptions): Promise<IngestResult> {
       if (events.length === 0) {
         return { accepted: 0, failed: 0 }
       }
 
       let lastError: unknown
       for (let i = 0; i < attempts; i += 1) {
+        if (options?.signal?.aborted) {
+          break
+        }
         try {
-          return await attempt(events)
+          return await attempt(events, options?.signal)
         } catch (error) {
           lastError = error
+          if (options?.signal?.aborted) {
+            break
+          }
         }
       }
       log(`Failed to ingest ${events.length} event(s) to ${config.host}: ${String(lastError)}`)
