@@ -138,6 +138,15 @@ All notable changes to this project are documented in this file. Format based on
 
 ### Changed
 
+- Distributed as a git package: the repository is installed with
+  `opencode plugin add https://github.com/nathanpt/opencode-langfuse.git`. `dist/index.js` is
+  now committed (self-contained bundle; the dev-time `effect/*` imports resolve host-side),
+  `exports`/`main` point at the bundle, and the runtime dependencies moved to
+  `devDependencies`. The local build script was renamed `npm run build` → `npm run bundle`
+  because a manifest script named `build` triggers OpenCode v2.0.31's broken git-prepare flow
+  (see the API reference) and would make `plugin add` fail. Consumer install verified
+  end-to-end: `plugin add` from the git URL, then a real session loading the git-installed
+  bundle.
 - Catalog-priced generations now select the cost tier by context threshold instead of always
   quoting tier 0: the discriminator is the prompt context (`input + cacheRead + cacheWrite`),
   and the highest exceeded `context.size` in the native catalog applies (host-verified

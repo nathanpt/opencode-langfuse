@@ -52,6 +52,13 @@ export default Plugin.define({
 - `-` prefix disables a plugin; `*` matches all; later entries re-enable. Two built-ins ignore
   removal.
 - CLI: `opencode plugin add|list|check|update|remove` (package plugins; npm/Git specs supported).
+  **Runtime-probed limitation (2026-11-10, v2.0.31):** `plugin add <git-url>` fails with
+  `git dep preparation failed` for any git package whose manifest has `workspaces` or a script
+  named `build`/`install`/`preinstall`/`postinstall`/`prepack`/`prepare` — pacote then spawns
+  `/$bunfs/bin/npm-cli.js` (a path inside the opencode binary's virtual filesystem) and the
+  fresh child process cannot resolve it. Dependency-less script-less git packages (and bundled
+  ones shaped to avoid the trigger names) install fine; the install then loads the package's
+  resolved entry from the opencode npm cache (`~/.cache/opencode/npm/git-<slug>-<hash>/…`).
 - Hot reload: watched config dirs reload automatically; `opencode service restart` otherwise.
 
 ## Hook surface relevant to tracing (all verified in the server doc)

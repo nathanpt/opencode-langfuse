@@ -11,7 +11,9 @@
   feature list (`docs/feature-list.json`) is complete: features 001–013 all `passes: true`.
   Out-of-contract maintenance 2026-11-10: catalog tier selection implemented and
   live-verified, committed as 24766cd (ADR-0002 amendment) — the deferred tier-discriminator
-  item is closed.
+  item is closed. Distribution channel shipped the same day (204471b + follow-ups): git,
+  public remote `https://github.com/nathanpt/opencode-langfuse.git`, self-contained bundle
+  committed, consumer install verified end-to-end.
 
 ## Confirmed working surfaces
 
@@ -247,9 +249,14 @@
 
 ## Blockers and unknowns
 
-- None blocking. Open items: distribution channel (npm vs git) deferred to first release —
-  `dist/` is gitignored meanwhile. `GET /api/command` not listing plugin-registered commands is
-  a v2.0.31 native behavior (recorded in the API reference), not a plugin defect.
+- None blocking. `GET /api/command` not listing plugin-registered commands is a v2.0.31 native
+  behavior (recorded in the API reference), not a plugin defect. Native OpenCode limitation
+  (recorded 2026-11-10, API reference): `opencode plugin add <git-url>` fails for any git
+  package whose manifest carries `workspaces` or a script named `build`/`install`/
+  `preinstall`/`postinstall`/`prepack`/`prepare` — the git-prepare spawn resolves npm-cli
+  through the bun binary's virtual FS and dies. This plugin avoids the trigger by shipping a
+  self-contained bundle (`dist/index.js` in git) with no trigger scripts; the manifest's
+  dependencies live in `devDependencies` and `npm run build` was renamed `npm run bundle`.
 
 ## Verification status
 
@@ -273,5 +280,8 @@
 ## Next useful move
 
 - The feature list is complete; the tier-discriminator item is closed (ADR-0002 amendment,
-  live-verified, committed as 24766cd). Remaining operator-driven follow-up: the distribution
-  channel decision (npm vs git), then first-release chores (version, CHANGELOG dates, README).
+  live-verified, committed as 24766cd). The distribution channel is decided and shipped:
+  **git** via `https://github.com/nathanpt/opencode-langfuse.git` (public). Consumer path
+  verified end-to-end 2026-11-10 (`opencode plugin add <url>` → real session loads the
+  git-installed `dist/index.js`, honest Disabled banner without config). Remaining
+  first-release chores: version tag (`v0.0.1` untagged), CHANGELOG dates at release, README.
