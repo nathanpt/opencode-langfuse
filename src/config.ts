@@ -3,15 +3,19 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { z } from "zod"
 import type { PrivacyPreset } from "./capture-policy.js"
+import type { PricingOverrides } from "./pricing.js"
 
 const DEFAULT_HOST = "https://cloud.langfuse.com"
 const CONFIG_FILE_RELPATH = ".config/opencode-langfuse/config.json"
 
+/** Rates are USD per million tokens: finite, nonnegative; zero is a valid price. */
+const finiteRate = z.number().finite().nonnegative()
+
 const pricingEntrySchema = z.object({
-  input: z.number(),
-  output: z.number(),
-  cacheRead: z.number().optional(),
-  cacheWrite: z.number().optional(),
+  input: finiteRate,
+  output: finiteRate,
+  cacheRead: finiteRate.optional(),
+  cacheWrite: finiteRate.optional(),
 })
 
 const fileConfigSchema = z.object({
@@ -36,6 +40,8 @@ export interface ResolvedConfig {
   secretKey: string
   host: string
   privacyPreset?: PrivacyPreset
+  /** File pricing entries; present only when the selected file branch supplied them. */
+  pricing?: PricingOverrides
 }
 
 export interface UnresolvedConfig {
@@ -52,6 +58,16 @@ export interface LoadConfigOptions {
 
 function nonEmpty(value: string | undefined): value is string {
   return typeof value === "string" && value.trim().length > 0
+}
+
+/**
+ * Pricing keys are exact `${providerID}/${model.id}` strings, split at the
+ * first slash; model ids may contain further slashes. Bare model aliases,
+ * empty components, and case games are rejected, never guessed.
+ */
+function validPricingKey(key: string): boolean {
+  const slash = key.indexOf("/")
+  return slash > 0 && slash < key.length - 1
 }
 
 async function readConfigFile(homeDir: string): Promise<{ config: FileConfig } | { reason: string }> {
@@ -72,6 +88,15 @@ async function readConfigFile(homeDir: string): Promise<{ config: FileConfig } |
     const issue = parsed.error.issues[0]
     const where = issue ? `${issue.path.join(".") || "config"}: ${issue.message}` : "unknown validation error"
     return { reason: `config file failed validation (${where})` }
+  }
+  if (parsed.data.pricing !== undefined) {
+    for (const key of Object.keys(parsed.data.pricing)) {
+      if (!validPricingKey(key)) {
+        return {
+          reason: `config file failed validation (pricing.${JSON.stringify(key)}: pricing keys must be "<providerID>/<model.id>")`,
+        }
+      }
+    }
   }
   return { config: parsed.data }
 }
@@ -103,6 +128,7 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Crede
       ...(fromFile.config.privacyPreset !== undefined
         ? { privacyPreset: fromFile.config.privacyPreset }
         : {}),
+      ...(fromFile.config.pricing !== undefined ? { pricing: fromFile.config.pricing } : {}),
     }
   }
 

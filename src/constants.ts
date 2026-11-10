@@ -20,6 +20,9 @@ export const FLUSH_GRACE_MS = 1_500
 /** Per-attempt ingestion POST timeout. */
 export const INGEST_TIMEOUT_MS = 10_000
 
+/** Rates are USD per 1,000,000 tokens; computed cost amounts are USD. */
+export const PRICE_PER_MILLION = 1_000_000
+
 /** Bounded cap for the final shutdown flush. */
 export const SHUTDOWN_TIMEOUT_MS = 5_000
 

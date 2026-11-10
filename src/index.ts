@@ -3,6 +3,7 @@ import { createCapturePolicy } from "./capture-policy.js"
 import { MAX_STRING_LENGTH } from "./constants.js"
 import { loadConfig, maskPublicKey } from "./config.js"
 import { createLangfuseTransport } from "./langfuse.js"
+import { createPricingResolver } from "./pricing.js"
 import { redactValue } from "./redaction.js"
 import { createTracker, type AssistantSnapshot, type SessionSnapshot } from "./tracker.js"
 import type { ModelReference } from "./generations.js"
@@ -149,6 +150,14 @@ export default Plugin.define({
     const tracker = createTracker({
       transport,
       policy: createCapturePolicy({ preset: config.privacyPreset }),
+      // One resolver for the plugin lifetime: file pricing overrides (env
+      // selection never carries pricing) plus the native catalog loader. The
+      // catalog is loaded lazily on the first lookup without an exact
+      // override, i.e. after hooks and subscription are installed.
+      pricing: createPricingResolver({
+        overrides: config.pricing,
+        loadCatalog: () => ctx.model.list(),
+      }),
       lookupSession: async (sessionID) => {
         // Direct result shapes (verified by the identity preflight); no guessed
         // envelopes are ported.

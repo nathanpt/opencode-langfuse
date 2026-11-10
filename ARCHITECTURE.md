@@ -2,7 +2,7 @@
 
 Status: implementation phase. Facts are verified against the OpenCode v2 plugin docs (fetched
 2026-11-09, against installed opencode v2.0.31) and a read of the sibling `omp-langfuse` v0.4.0
-source. Features 001/002/003/010 are implemented and live-verified (see PROGRESS.md);
+source. Features 001/002/003/004/005/010 are implemented and live-verified (see PROGRESS.md);
 remaining features and items marked **UNKNOWN** are open work; see docs/feature-list.json.
 
 ## What this system is
@@ -26,8 +26,10 @@ no local storage tier; the only buffering is in-memory between an event and the 
     (`"completed" | "error"`), `result`, `error`.
   - `ctx.event.subscribe({ types?, signal })` — public event stream (e.g. `session.idle`).
 - Context reads this design uses: `ctx.session.get/context/list`, `ctx.model.list` (Model.Info
-  carries `cost` tiers — unit semantics **UNKNOWN**), `ctx.vcs` (repo info/status),
-  `ctx.location` (directory, project), `ctx.options`, `ctx.storage` (durable plugin-scoped JSON).
+  carries `cost` tiers — USD per 1M tokens, resolved 2026-11-09 (R2); returns `{location, data}`;
+  config-defined providers' models are omitted — known gap per ADR-0002), `ctx.vcs` (repo
+  info/status), `ctx.location` (directory, project), `ctx.options`, `ctx.storage` (durable
+  plugin-scoped JSON).
 - Loading/discovery: `.opencode/plugins/` auto-discovery; `plugins` array in `opencode.json(c)`
   (object form passes `ctx.options`); `opencode plugin add/list/remove`; watched config dirs hot-
   reload. Local plugins may be `.ts` directly.
@@ -39,7 +41,8 @@ setup(ctx)
 ├── config      credentials + options: env vars → 0600 config file    [ADR-0001, accepted]
 ├── capture     privacy presets + redaction      port of omp-langfuse capture-policy/redaction
 ├── observe     hook/event → observation builders: session, generation, tool, compaction
-├── pricing     price resolution + cost          port of pricing.ts; layered resolution per ADR-0002
+├── pricing     price resolution + cost          implemented (src/pricing.ts); layered
+│                                                resolution per ADR-0002, no runtime deps
 ├── metadata    git/repo source metadata         via ctx.vcs (replaces sibling's manual git)
 ├── transport   Langfuse REST ingestion client + flush/shutdown (scores land with a later feature)
 └── state       per-session state + score aggregation, keyed by sessionID
@@ -61,9 +64,12 @@ scores (`tool_call_count`, `turn_count`, `total_tool_errors`, `tool_success_rate
 Implemented so far: the trace/root with **deterministic identity** derived from the session id
 (ADR-0003), one generation per primary request acquired from durable `session.step.*` identity,
 tagged auxiliary generations acquired from `http.request`/`http.response` via exact
-`Request` identity (demand-driven body observer, full-completion timing), and token `usageDetails`
-on primary generations from the R1 capture point (ADR-0002). Still to come: self-computed cost
-(005), compaction spans (007), scores (009), child traces (013).
+`Request` identity (demand-driven body observer, full-completion timing), token `usageDetails`
+on primary generations from the R1 capture point, and self-computed `costDetails` per ADR-0002
+(feature-005: usage × one resolved price from config override → catalog first tier → bundled
+table; omitted with a once-per-model warning when unresolvable; host `cost` kept only as
+diagnostic `metadata.hostCost`). Still to come: compaction spans (007), scores (009), child
+traces (013).
 
 ## Design decisions (all five resolved 2026-11-09)
 

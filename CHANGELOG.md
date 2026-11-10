@@ -7,6 +7,20 @@ All notable changes to this project are documented in this file. Format based on
 
 ### Added
 
+- Self-computed generation cost (feature-005): primaries carry `costDetails` computed once from
+  the request's normalized usage and an independently resolved price — never the host's `cost`,
+  which is recorded only as diagnostic `metadata.hostCost`. Price resolution per ADR-0002 in
+  strict order (config override → native catalog first tier → bundled table → omitted with a
+  once-per-model warning), never mixing sources: positive cache usage against a source missing
+  that rate omits the entire cost. Explicit zero prices are honored (true zero cost); an
+  all-zero catalog tier is unpriced and falls through. Catalog quotes carry `pricingTier:0`,
+  `pricingTierCount`, and honest first-tier approximation flags; DeepSeek-V4 bundled quotes are
+  flagged `pricingAssumption:"off-peak"`. A slow catalog is bounded at one 3 s attempt per
+  plugin lifetime (cached failure, no repricing). Verified live on the self-hosted Langfuse:
+  override totals 0.00011925/0.0002685 (cache-heavy) against the host's cache-dropping
+  0.0001185, bundled GLM 0.0000839, true zero for explicit-free, absent `costDetails` (not
+  zero) for unpriced and missing-cache-rate models, and unchanged numeric cost under the
+  metadata-only preset.
 - Token usage on generations (feature-004): primary generations carry `usageDetails`
   (input/output/total plus non-zero reasoning/cacheRead/cacheWrite) taken verbatim from the
   durable `session.step.ended` token totals — OpenCode's R1-decided capture point; partial usage

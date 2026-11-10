@@ -5,7 +5,7 @@
 - Branch `master`. Foundation committed (030160b); features 001, 002, 010 implemented and
   committed after live verification (per-feature commit policy, operator-approved 2026-11-09);
   feature-003 implemented and live-verified 2026-11-09; feature-004 implemented and
-  live-verified 2026-11-09 (this change).
+  live-verified 2026-11-09; feature-005 implemented and live-verified 2026-11-10 (this change).
 
 ## Confirmed working surfaces
 
@@ -49,12 +49,31 @@
   (`session.step.ended`); partial usage from `session.step.failed` included when reported;
   auxiliary generations carry no plugin-supplied usage. `costDetails` still absent
   (feature-005).
-- `npm run typecheck` (clean) and `npm test` (49/49) green; `npm run build` produces
+- **feature-005 (passing, live-verified 2026-11-10, harness `/tmp/oc-feature005`, e.g. trace
+  `064e3d660d9c4ce61d57f5a462fffa8a` / session `ses_e3c74942dffeJBJ7q85as5eVof`):** primaries
+  carry `costDetails` computed once from each request's own usage × an independently resolved
+  price (ADR-0002 order: exact config override → native catalog first tier → bundled table →
+  omitted + once-per-model warning; sources never mixed). Verified against the live Langfuse:
+  override `0.00011925` with all four components (host reported the cache-dropping
+  `0.0001185`; delta = exactly the cacheRead term); cache-heavy `0.0002685` with
+  `cacheRead 0.00015`; bundled glm-5.2 `0.0000839` (no guessed cacheWrite,
+  `pricingSource: bundled`); explicit-free true zero (`source: config`, no warning); unpriced
+  and missing-cache-rate sessions export NO `costDetails` key (submitted truth; Langfuse's API
+  reads back `{}`) with exactly one warning per provider/model across sessions; auxiliaries
+  carry no usage/cost/pricingSource; an invalid host cost never rejects valid tokens; computed
+  totals are unchanged by the host value. Catalog unavailability is bounded to one 3 s attempt
+  per plugin lifetime (cached failure; late settlement inert). Metadata-only restart: fresh
+  priced session keeps numeric usage/cost (`0.00011925`, `pricingSource: config`) while trace/
+  root/generation content stays absent and the CLI answer is normal.
+- `npm run typecheck` (clean) and `npm test` (88/88) green; `npm run build` produces
   `dist/index.js` (~1.8 MB, self-contained).
-- Verification harness: scratch project `/tmp/oc-feature003` (mock OpenAI-compatible provider on
-  `127.0.0.1:18123` from `/tmp/oc-feature003/mock-server.mjs`, built plugin under
-  `.opencode/plugins/`, foreground `opencode serve` + `opencode run --server`). The earlier
-  `/tmp/oc-verify` harness (port 8123) predates this change.
+- Verification harness: scratch project `/tmp/oc-feature005` (mock OpenAI-compatible provider
+  on `127.0.0.1:18125` with a Langfuse ingestion forwarding recorder from
+  `/tmp/oc-feature005/mock-server.mjs`, built plugin under `.opencode/plugins/`, foreground
+  `opencode serve` on `127.0.0.1:14105` + `opencode run --server`, temporary HOME with a 0600
+  plugin config; assertions in `assert-live.mjs`/`assert-submitted.mjs`). The earlier
+  `/tmp/oc-feature003` harness (port 18123) verified feature-004; `/tmp/oc-verify` (port 8123)
+  predates both.
 
 ## Operational findings worth remembering
 
@@ -84,13 +103,13 @@
 
 ## Active work
 
-- **feature-005** — self-computed cost per ADR-0002 (`costDetails` = usage × resolved price;
-  layered resolution; one-time warning for unpriced models; host `cost` never trusted).
+- None in flight. feature-005 done; remaining features 006–013 per `docs/feature-list.json`.
 
 ## Blockers and unknowns
 
-- None blocking. Open items: tier discriminator for context-threshold pricing (ADR-0002 note);
-  distribution channel (npm vs git) deferred to first release — `dist/` is gitignored meanwhile.
+- None blocking. Open items: tier discriminator for context-threshold pricing (ADR-0002 note —
+  v0 quotes tier zero and flags `firstTierApproximation`); distribution channel (npm vs git)
+  deferred to first release — `dist/` is gitignored meanwhile.
 
 ## Verification status
 
@@ -99,10 +118,10 @@
 - feature-002: passing (live evidence 2026-11-09; identity mechanics superseded by ADR-0003).
 - feature-003: passing (live evidence above, 2026-11-09; ADR-0003).
 - feature-004: passing (live evidence above, 2026-11-09; capture point per ADR-0002/R1).
-- Features 005–013: failing/unverified (see docs/feature-list.json).
+- feature-005: passing (live evidence above, 2026-11-10; pricing layers per ADR-0002).
+- Features 006–013: failing/unverified (see docs/feature-list.json).
 
 ## Next useful move
 
-- Implement feature-005: self-computed `costDetails` = usage × resolved price (ADR-0002 layer
-  order: config override → catalog tier → bundled table; omit + one-time warning when
-  unresolvable; never trust host `cost`), live-verified on a priced and an unpriced model.
+- Select the next feature from `docs/feature-list.json` (006–013) and implement one bounded
+  unit at a time, live-verifying any trace-path change against the real Langfuse.

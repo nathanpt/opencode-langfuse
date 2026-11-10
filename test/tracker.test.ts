@@ -3,6 +3,7 @@ import { createHash } from "node:crypto"
 import { test } from "node:test"
 import { createCapturePolicy } from "../src/capture-policy.js"
 import type { IngestEvent, IngestResult, LangfuseTransport } from "../src/langfuse.js"
+import { createPricingResolver, type PricingResolver, type PricingOverrides } from "../src/pricing.js"
 import type { AssistantSnapshot, SessionSnapshot, Tracker, TrackerOptions } from "../src/tracker.js"
 import { createTracker } from "../src/tracker.js"
 
@@ -59,6 +60,29 @@ interface LogSpy {
   messages: string[]
 }
 
+/** Fresh real resolver per fixture: empty overrides/catalog — unpriced models. */
+function testPricing(overrides?: PricingOverrides, logs?: string[]): PricingResolver {
+  return createPricingResolver({
+    ...(overrides ? { overrides } : {}),
+    loadCatalog: async () => ({ data: [] }),
+    ...(logs ? { log: (message: string) => logs.push(message) } : { log: () => {} }),
+  })
+}
+
+const OVERRIDE_PRICE = { input: 1.5, output: 9, cacheRead: 0.15, cacheWrite: 1.25 }
+
+function near(actual: number | undefined, expected: number, message?: string): void {
+  const tolerance = Math.max(1e-12, Math.abs(expected) * 1e-9)
+  assert.ok(
+    actual !== undefined && Math.abs(actual - expected) <= tolerance,
+    message ?? `expected ${actual} to be ≈ ${expected}`,
+  )
+}
+
+function omissionWarnings(logs: string[]): string[] {
+  return logs.filter((m) => m.includes("Cost omitted for model"))
+}
+
 function makeTracker(
   transport: FakeTransport,
   overrides: Partial<TrackerOptions> = {},
@@ -68,6 +92,7 @@ function makeTracker(
   return createTracker({
     transport,
     policy: POLICY,
+    pricing: testPricing(),
     flushDelayMs: 5,
     newId: () => `id-${(seq += 1)}`,
     now: () => BASE + 10_000,
@@ -271,9 +296,14 @@ test("primary endTime is the stream boundary even when tool settlement lags", as
   assert.equal(metaOf(gen).finishReason, "tool-calls")
 })
 
-test("step.failed produces an error generation with redacted text, partial usage, and no host cost", async () => {
+test("step.failed keeps ERROR, computes partial cost independently, and records host cost as metadata only", async () => {
   const transport = fakeTransport()
-  const tracker = makeTracker(transport)
+  const logs: string[] = []
+  const tracker = makeTracker(
+    transport,
+    { pricing: testPricing({ "mock/mock-1": OVERRIDE_PRICE }, logs) },
+    { messages: logs },
+  )
   tracker.handleEvent(inboxPrompt("p"))
   tracker.handleEvent(stepStarted("msg_f", { seq: 2 }))
   tracker.handleEvent(stepFailed("msg_f", "provider said SECRET_TOKEN=supersecretvalue", BASE + 700, 3))
@@ -286,11 +316,20 @@ test("step.failed produces an error generation with redacted text, partial usage
   assert.equal(gen.body.statusMessage, "provider said SECRET_TOKEN=[REDACTED_SECRET]")
   const wire = JSON.stringify(gen)
   assert.ok(!wire.includes("supersecretvalue"))
-  assert.ok(!wire.includes("cost"), "host cost is never imported (feature-005)")
+  assert.equal(metaOf(gen).hostCost, 3, "host cost is diagnostic metadata, not arithmetic")
   const usage = gen.body.usageDetails as Record<string, number>
   assert.deepEqual(usage, { input: 4, output: 0, total: 5, cacheRead: 1 }, "partial usage from the failure event")
   assert.ok(!("input" in gen.body))
   assert.ok(!("output" in gen.body))
+  const cost = gen.body.costDetails as Record<string, number>
+  assert.ok(cost, "partial usage still gets partial computed cost")
+  near(cost.input, 4 * 1.5 / 1_000_000)
+  near(cost.output, 0)
+  near(cost.cacheRead, 1 * 0.15 / 1_000_000)
+  near(cost.total, (4 * 1.5 + 1 * 0.15) / 1_000_000)
+  assert.ok(!("reasoning" in cost), "zero reasoning usage emits no reasoning cost")
+  assert.equal(metaOf(gen).pricingSource, "config")
+  assert.equal(omissionWarnings(logs).length, 0)
 })
 
 test("primary generations carry usageDetails matching the durable step tokens", async () => {
@@ -313,6 +352,8 @@ test("primary generations carry usageDetails matching the durable step tokens", 
   const aux = generationsOf(events).filter((e) => e.body.name !== "llm-generation")
   for (const a of aux) {
     assert.ok(!("usageDetails" in a.body), "auxiliary generations carry no guessed usage")
+    assert.ok(!("costDetails" in a.body), "auxiliary generations carry no guessed cost")
+    assert.ok(!("pricingSource" in metaOf(a)), "auxiliaries never resolve prices")
   }
 })
 
@@ -610,6 +651,7 @@ test("metadata-only preset exports no provider text and still redacts metadata s
   const tracker = createTracker({
     transport,
     policy: createCapturePolicy({ preset: "metadata-only", env: FULL_ENV }),
+    pricing: testPricing(),
     flushDelayMs: 5,
     newId: () => `id-${Math.random()}`,
     now: () => BASE,
@@ -729,6 +771,7 @@ test("shutdown marks running work interrupted, aborts ingestion, and disables la
   const tracker = createTracker({
     transport,
     policy: POLICY,
+    pricing: testPricing(),
     flushDelayMs: 5,
     newId: () => `id-${Math.random()}`,
     now: () => BASE,
@@ -775,4 +818,416 @@ test("shutdown marks running work interrupted, aborts ingestion, and disables la
   await tracker.handleEvent(inboxPrompt("after shutdown"))
   await tracker.flushAll()
   assert.equal(ingestCalls, callsAtShutdown)
+})
+
+test("computed cost follows each request's own model across a model switch", async () => {
+  const transport = fakeTransport()
+  const logs: string[] = []
+  const tracker = makeTracker(
+    transport,
+    { pricing: testPricing({ "mock/mock-1": OVERRIDE_PRICE }, logs) },
+    { messages: logs },
+  )
+  tracker.handleEvent(inboxPrompt("p"))
+  tracker.handleEvent(stepStarted("msg_a", { seq: 2 }))
+  tracker.handleEvent(stepEnded("msg_a", "tool-calls", BASE + 220, 3))
+  tracker.handleEvent(stepStarted("msg_b", { model: "glm-5.2", started: BASE + 250, created: BASE + 251, seq: 4 }))
+  tracker.handleEvent(
+    ev(
+      "session.step.ended",
+      BASE + 262,
+      {
+        sessionID: SID,
+        assistantMessageID: "msg_b",
+        finish: "stop",
+        // No host cost on this event: no hostCost metadata may be invented.
+        tokens: { input: 37, output: 5, reasoning: 2, cache: { read: 5, write: 0 } },
+      },
+      5,
+    ),
+  )
+  await tracker.flushAll()
+
+  const primaries = generationsOf(flatten(transport)).filter((e) => e.body.name === "llm-generation")
+  assert.equal(primaries.length, 2)
+  const [genA, genB] = primaries
+  assert.equal(genA.body.model, "mock-1")
+  const costA = genA.body.costDetails as Record<string, number>
+  near(costA.total, 0.00011925, "mock-1 uses the config override rates")
+  assert.equal(metaOf(genA).pricingSource, "config")
+  assert.equal(metaOf(genA).hostCost, 5, "host value recorded but not used")
+
+  assert.equal(genB.body.model, "glm-5.2")
+  const costB = genB.body.costDetails as Record<string, number>
+  near(costB.total, 0.0000839, "glm-5.2 uses bundled rates for its own request")
+  assert.equal(metaOf(genB).pricingSource, "bundled")
+  assert.ok(!("hostCost" in metaOf(genB)), "a step without a host cost emits no hostCost metadata")
+  assert.equal(omissionWarnings(logs).length, 0)
+})
+
+test("a deliberately wrong host cost never changes the computed cost", async () => {
+  const transport = fakeTransport()
+  let wrong = true
+  const stepEndedWithCost = (id: string, created: number, seq: number) => ({
+    ...ev(
+      "session.step.ended",
+      created,
+      {
+        sessionID: SID,
+        assistantMessageID: id,
+        finish: "stop",
+        cost: wrong ? 999 : 5,
+        tokens: { input: 37, output: 5, reasoning: 2, cache: { read: 5, write: 0 } },
+      },
+      seq,
+    ),
+  })
+  const tracker = makeTracker(transport, { pricing: testPricing({ "mock/mock-1": OVERRIDE_PRICE }) })
+  tracker.handleEvent(inboxPrompt("p"))
+  tracker.handleEvent(stepStarted("msg_w", { seq: 2 }))
+  tracker.handleEvent(stepEndedWithCost("msg_w", BASE + 300, 3))
+  await tracker.flushAll()
+  const wrongCost = generationsOf(flatten(transport))[0]
+  near((wrongCost.body.costDetails as Record<string, number>).total, 0.00011925)
+  assert.equal(metaOf(wrongCost).hostCost, 999)
+
+  wrong = false
+  const tracker2 = makeTracker(transport, { pricing: testPricing({ "mock/mock-1": OVERRIDE_PRICE }) })
+  tracker2.handleEvent(inboxPrompt("p"))
+  tracker2.handleEvent(stepStarted("msg_w", { seq: 2 }))
+  tracker2.handleEvent(stepEndedWithCost("msg_w", BASE + 300, 3))
+  await tracker2.flushAll()
+  const rightCost = generationsOf(flatten(transport).slice(-2))[0]
+  assert.deepEqual(
+    rightCost.body.costDetails,
+    wrongCost.body.costDetails,
+    "computed cost is identical regardless of the host value",
+  )
+})
+
+test("an invalid diagnostic host cost never rejects valid usage or terminal state", async () => {
+  for (const bogus of ["0.5", -3, Number.NaN, { total: 1 }]) {
+    const transport = fakeTransport()
+    const tracker = makeTracker(transport, { pricing: testPricing({ "mock/mock-1": OVERRIDE_PRICE }) })
+    tracker.handleEvent(inboxPrompt("p"))
+    tracker.handleEvent(stepStarted("msg_i", { seq: 2 }))
+    tracker.handleEvent(
+      ev(
+        "session.step.ended",
+        BASE + 300,
+        {
+          sessionID: SID,
+          assistantMessageID: "msg_i",
+          finish: "stop",
+          cost: bogus,
+          tokens: { input: 37, output: 5, reasoning: 2, cache: { read: 5, write: 0 } },
+        },
+        3,
+      ),
+    )
+    await tracker.flushAll()
+    const gen = generationsOf(flatten(transport))[0]
+    assert.equal(metaOf(gen).captureStatus, "completed", `bogus cost ${JSON.stringify(bogus)} is ignored`)
+    assert.deepEqual(gen.body.usageDetails, { input: 37, output: 5, total: 49, reasoning: 2, cacheRead: 5 })
+    assert.ok(!("hostCost" in metaOf(gen)), `bogus cost ${JSON.stringify(bogus)} is not exported`)
+    near((gen.body.costDetails as Record<string, number>).total, 0.00011925)
+  }
+})
+
+test("a failure without usage emits no computed cost and no missing-price warning", async () => {
+  const transport = fakeTransport()
+  const logs: string[] = []
+  const tracker = makeTracker(transport, { pricing: testPricing(undefined, logs) }, { messages: logs })
+  tracker.handleEvent(inboxPrompt("p"))
+  tracker.handleEvent(stepStarted("msg_bare", { seq: 2 }))
+  tracker.handleEvent(
+    ev(
+      "session.step.failed",
+      BASE + 700,
+      {
+        sessionID: SID,
+        assistantMessageID: "msg_bare",
+        error: { type: "provider", message: "boom" },
+        cost: 7,
+      },
+      3,
+    ),
+  )
+  await tracker.flushAll()
+  const gen = generationsOf(flatten(transport))[0]
+  assert.equal(metaOf(gen).captureStatus, "error")
+  assert.equal(metaOf(gen).hostCost, 7, "host cost is still diagnostic metadata")
+  assert.ok(!("costDetails" in gen.body), "no usage means no cost")
+  assert.ok(!("usageDetails" in gen.body))
+  assert.equal(omissionWarnings(logs).length, 0, "pricing is never invoked without usage")
+})
+
+test("a recovered missing-start generation prices from its recovered model", async () => {
+  const transport = fakeTransport()
+  const logs: string[] = []
+  const tracker = makeTracker(
+    transport,
+    {
+      pricing: testPricing({ "mock/mock-2": { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } }, logs),
+      lookupAssistant: async (_sessionID, assistantMessageID): Promise<AssistantSnapshot | undefined> =>
+        assistantMessageID === "msg_lost"
+          ? { id: "msg_lost", agent: "build", model: { id: "mock-2", providerID: "mock" }, createdAt: BASE + 50, streamedAt: BASE + 90 }
+          : undefined,
+    },
+    { messages: logs },
+  )
+  tracker.handleEvent(inboxPrompt("p"))
+  tracker.handleEvent(stepEnded("msg_lost", "stop", BASE + 120, 2))
+  await tracker.flushNow(SID)
+
+  const gen = generationsOf(flatten(transport))[0]
+  assert.equal(gen.body.model, "mock-2", "cost follows the recovered identity, not a default")
+  const cost = gen.body.costDetails as Record<string, number>
+  near(cost.total, (37 * 3 + 5 * 15 + 2 * 15 + 5 * 0.3) / 1_000_000)
+  assert.equal(metaOf(gen).pricingSource, "config")
+  assert.equal(omissionWarnings(logs).length, 0)
+})
+
+test("duplicate durable endings do not re-price or re-export", async () => {
+  const transport = fakeTransport()
+  const tracker = makeTracker(transport, { pricing: testPricing({ "mock/mock-1": OVERRIDE_PRICE }) })
+  tracker.handleEvent(inboxPrompt("p"))
+  tracker.handleEvent(stepStarted("msg_d", { seq: 2 }))
+  tracker.handleEvent(stepEnded("msg_d", "stop", BASE + 300, 3))
+  tracker.handleEvent(stepEnded("msg_d", "stop", BASE + 300, 3))
+  await tracker.flushAll()
+  const events = flatten(transport).filter((e) => e.body.id === expectedGenerationId(SID, "msg_d"))
+  assert.equal(events.length, 1, "exactly one generation event for the duplicated ending")
+  assert.equal(events[0].type, "generation-create")
+  assert.ok("costDetails" in events[0].body)
+})
+
+test("an unexported create coalesces usage and cost into one complete create", async () => {
+  const transport = fakeTransport()
+  const tracker = makeTracker(transport, { pricing: testPricing({ "mock/mock-1": OVERRIDE_PRICE }), flushDelayMs: 60_000 })
+  tracker.handleEvent(inboxPrompt("p"))
+  tracker.handleEvent(stepStarted("msg_c", { seq: 2 }))
+  tracker.handleEvent(stepEnded("msg_c", "stop", BASE + 300, 3))
+  await tracker.flushNow(SID)
+
+  const events = flatten(transport).filter((e) => e.body.id === expectedGenerationId(SID, "msg_c"))
+  assert.equal(events.length, 1)
+  assert.equal(events[0].type, "generation-create", "create and pricing coalesce before the first export")
+  assert.deepEqual(events[0].body.usageDetails, { input: 37, output: 5, total: 49, reasoning: 2, cacheRead: 5 })
+  near((events[0].body.costDetails as Record<string, number>).total, 0.00011925)
+})
+
+test("a create exported while pricing was pending is completed by an ordered update", async () => {
+  const gate = Promise.withResolvers<unknown>()
+  const transport = fakeTransport()
+  const resolver = createPricingResolver({
+    overrides: { "mock/mock-1": OVERRIDE_PRICE },
+    loadCatalog: () => gate.promise,
+    log: () => {},
+  })
+  const tracker = createTracker({
+    transport,
+    policy: POLICY,
+    pricing: resolver,
+    flushDelayMs: 5,
+    newId: (() => {
+      let seq = 0
+      return () => `id-${(seq += 1)}`
+    })(),
+    now: () => BASE + 10_000,
+    log: () => {},
+  })
+  tracker.handleEvent(inboxPrompt("p"))
+  tracker.handleEvent(stepStarted("msg_p", { seq: 2 }))
+  await tracker.flushNow(SID)
+  assert.equal(transport.batches.length, 1, "create exports without usage while pricing waits")
+  const create = transport.batches[0].find((e) => e.type === "generation-create")
+  assert.ok(create && !("costDetails" in create.body))
+
+  tracker.handleEvent(stepEnded("msg_p", "stop", BASE + 300, 3))
+  // The session chain is held by the pending quote; nothing exports yet.
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  assert.equal(transport.batches.length, 1, "the pending quote holds this session's export")
+
+  gate.resolve({ data: [] })
+  await tracker.flushNow(SID)
+  const update = flatten(transport).find((e) => e.type === "generation-update" && e.body.id === expectedGenerationId(SID, "msg_p"))
+  assert.ok(update, "cost arrives in an update on the same observation")
+  assert.ok("costDetails" in update.body)
+  near((update.body.costDetails as Record<string, number>).total, 0.00011925)
+  // The submitted create snapshot was never mutated retroactively.
+  assert.ok(!("costDetails" in transport.batches[0].find((e) => e.type === "generation-create")!.body))
+})
+
+test("terminal state and pricing resolve while ingest is held, then export in order", async () => {
+  const release = Promise.withResolvers<void>()
+  const transport = fakeTransport()
+  const settledIngest = transport.ingest.bind(transport)
+  let ingestCalls = 0
+  // Holds every POST until released: the event path keeps working meanwhile.
+  transport.ingest = async (events, options) => {
+    ingestCalls += 1
+    await release.promise
+    return settledIngest(events, options)
+  }
+  const tracker = makeTracker(transport, { pricing: testPricing({ "mock/mock-1": OVERRIDE_PRICE }), flushDelayMs: 5 })
+  const first = tracker.flushNow(SID).then(() => tracker.flushNow(SID))
+  tracker.handleEvent(inboxPrompt("p"))
+  tracker.handleEvent(stepStarted("msg_h", { seq: 2 }))
+  tracker.handleEvent(stepEnded("msg_h", "stop", BASE + 300, 3))
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  assert.equal(ingestCalls > 0, true, "a flush is already held on the transport")
+  release.resolve()
+  await first
+
+  const genEvents = flatten(transport).filter((e) => e.body.id === expectedGenerationId(SID, "msg_h"))
+  assert.equal(genEvents.length, 1)
+  assert.equal(genEvents[0].type, "generation-create", "held ingest coalesces terminal + pricing into one create")
+  near((genEvents[0].body.costDetails as Record<string, number>).total, 0.00011925)
+  assert.equal(metaOf(genEvents[0]).captureStatus, "completed")
+})
+
+test("late pricing completion after closing creates no exports", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  const gate = Promise.withResolvers<unknown>()
+  const transport = fakeTransport()
+  const resolver = createPricingResolver({
+    loadCatalog: () => gate.promise,
+    log: () => {},
+  })
+  const tracker = createTracker({
+    transport,
+    policy: POLICY,
+    pricing: resolver,
+    flushDelayMs: 5,
+    newId: () => `id-${Math.random()}`,
+    now: () => BASE,
+    log: () => {},
+  })
+  tracker.handleEvent(inboxPrompt("p"))
+  tracker.handleEvent(stepStarted("msg_late", { seq: 2 }))
+  tracker.handleEvent(stepEnded("msg_late", "stop", BASE + 300, 3))
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  assert.equal(transport.batches.length, 0, "the pending quote holds the export")
+
+  const shutdown = tracker.shutdown()
+  for (let i = 0; i < 5; i++) await new Promise<void>((resolve) => setImmediate(resolve))
+  t.mock.timers.tick(5_000)
+  await shutdown
+  const callsAtShutdown = transport.ingestCalls
+
+  gate.resolve({ data: [] })
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  assert.equal(transport.ingestCalls, callsAtShutdown, "late quote completion exports nothing after close")
+})
+
+test("an unavailable generation (no model) gets no cost and no missing-price warning", async () => {
+  const transport = fakeTransport()
+  const logs: string[] = []
+  const tracker = makeTracker(transport, { pricing: testPricing(undefined, logs) }, { messages: logs })
+  tracker.handleEvent(inboxPrompt("p"))
+  tracker.handleEvent(stepEnded("msg_ghost", "stop", BASE + 120, 2))
+  await tracker.flushNow(SID)
+  const gen = generationsOf(flatten(transport))[0]
+  assert.equal(metaOf(gen).captureStatus, "unavailable")
+  assert.ok(!("costDetails" in gen.body))
+  assert.equal(omissionWarnings(logs).length, 0, "missing model never invokes pricing")
+})
+
+test("metadata-only preset keeps numeric cost and omits content", async () => {
+  const transport = fakeTransport()
+  const tracker = createTracker({
+    transport,
+    policy: createCapturePolicy({ preset: "metadata-only", env: FULL_ENV }),
+    pricing: testPricing({ "mock/mock-1": OVERRIDE_PRICE }),
+    flushDelayMs: 5,
+    newId: () => `id-${Math.random()}`,
+    now: () => BASE,
+    log: () => {},
+  })
+  tracker.handleEvent(inboxPrompt("prompt carrying sk-lf-tokensecretvalue"))
+  tracker.handleEvent(stepStarted("msg_mo", { seq: 2 }))
+  tracker.handleEvent(textEnded("response carrying sk-lf-outputsecretvalue", BASE + 300, 3))
+  tracker.handleEvent(stepEnded("msg_mo", "stop", BASE + 310, 4))
+  await tracker.flushAll()
+  const wire = JSON.stringify(transport.batches)
+  assert.ok(!wire.includes("tokensecretvalue"))
+  const gen = generationsOf(flatten(transport)).find((e) => e.body.name === "llm-generation")!
+  assert.ok(!("input" in gen.body) && !("output" in gen.body))
+  near((gen.body.costDetails as Record<string, number>).total, 0.00011925, "numeric cost survives metadata-only")
+  assert.equal(metaOf(gen).pricingSource, "config")
+  assert.equal(metaOf(gen).hostCost, 5)
+})
+
+test("catalog quotes export honest tier metadata", async () => {
+  const transport = fakeTransport()
+  const resolver = createPricingResolver({
+    loadCatalog: async () => ({
+      data: [
+        {
+          id: "mock-1",
+          providerID: "mock",
+          cost: [
+            { input: 1.5, output: 9, cache: { read: 0.15, write: 1.25 } },
+            { input: 0.75, output: 4.5, cache: { read: 0.075, write: 0.6 }, tier: { type: "context", size: 200_000 } },
+          ],
+        },
+      ],
+    }),
+    log: () => {},
+  })
+  const tracker = createTracker({
+    transport,
+    policy: POLICY,
+    pricing: resolver,
+    flushDelayMs: 5,
+    newId: () => `id-${Math.random()}`,
+    now: () => BASE,
+    log: () => {},
+  })
+  tracker.handleEvent(inboxPrompt("p"))
+  tracker.handleEvent(stepStarted("msg_tier", { seq: 2 }))
+  tracker.handleEvent(stepEnded("msg_tier", "stop", BASE + 300, 3))
+  await tracker.flushAll()
+  const gen = generationsOf(flatten(transport)).find((e) => e.body.name === "llm-generation")!
+  assert.equal(metaOf(gen).pricingSource, "catalog")
+  assert.equal(metaOf(gen).pricingTier, 0)
+  assert.equal(metaOf(gen).pricingTierCount, 2)
+  assert.equal(metaOf(gen).pricingTierApproximation, "first-tier")
+  near((gen.body.costDetails as Record<string, number>).total, 0.00011925, "tier zero carries the quote")
+})
+
+test("bundled off-peak quotes export pricingAssumption metadata", async () => {
+  const transport = fakeTransport()
+  const tracker = makeTracker(transport, { pricing: testPricing() })
+  tracker.handleEvent(inboxPrompt("p"))
+  tracker.handleEvent(stepStarted("msg_ds", { model: "deepseek-v4-flash", seq: 2 }))
+  tracker.handleEvent(stepEnded("msg_ds", "stop", BASE + 300, 3))
+  await tracker.flushAll()
+  const gen = generationsOf(flatten(transport)).find((e) => e.body.name === "llm-generation")!
+  assert.equal(metaOf(gen).pricingSource, "bundled")
+  assert.equal(metaOf(gen).pricingAssumption, "off-peak")
+  const cost = gen.body.costDetails as Record<string, number>
+  near(cost.total, (37 * 0.22 + 5 * 0.66 + 2 * 0.66 + 5 * 0.007) / 1_000_000)
+  assert.ok(!("cacheWrite" in cost))
+})
+
+test("an unpriced primary omits costDetails entirely and warns once per tracker", async () => {
+  const transport = fakeTransport()
+  const logs: string[] = []
+  const tracker = makeTracker(transport, { pricing: testPricing(undefined, logs) }, { messages: logs })
+  tracker.handleEvent(inboxPrompt("p"))
+  tracker.handleEvent(stepStarted("msg_u1", { seq: 2 }))
+  tracker.handleEvent(stepEnded("msg_u1", "stop", BASE + 300, 3))
+  tracker.handleEvent(stepStarted("msg_u2", { model: "mock-2", started: BASE + 320, created: BASE + 321, seq: 4 }))
+  tracker.handleEvent(stepEnded("msg_u2", "stop", BASE + 330, 5))
+  await tracker.flushAll()
+  for (const gen of generationsOf(flatten(transport)).filter((e) => e.body.name === "llm-generation")) {
+    assert.ok(!("costDetails" in gen.body), "unresolved price means absent costDetails, not {total: 0}")
+    assert.ok(!("pricingSource" in metaOf(gen)))
+  }
+  assert.equal(omissionWarnings(logs).filter((m) => m.includes("mock/mock-1")).length, 1)
+  assert.equal(omissionWarnings(logs).filter((m) => m.includes("mock/mock-2")).length, 1)
 })

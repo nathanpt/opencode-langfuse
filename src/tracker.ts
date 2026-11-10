@@ -36,6 +36,7 @@ import {
 } from "./generations.js"
 import type { IngestEvent, LangfuseTransport } from "./langfuse.js"
 import { isRecord } from "./guards.js"
+import type { PricingResolver } from "./pricing.js"
 import { redactValue } from "./redaction.js"
 
 const finiteNumber = z.number().finite()
@@ -76,6 +77,9 @@ const stepKeySchema = z.object({
 const stepEndedSchema = stepKeySchema.and(
   z.object({
     finish: z.string(),
+    // Host-reported cost: diagnostic metadata only, never trusted (ADR-0002).
+    // Parsed defensively so an invalid value never rejects the event.
+    cost: z.unknown().optional(),
     tokens: z.object({
       input: finiteNumber,
       output: finiteNumber,
@@ -91,6 +95,9 @@ const stepFailedSchema = stepKeySchema.and(
       .object({ message: z.string().optional() })
       .loose()
       .optional(),
+    // Host-reported cost: diagnostic metadata only, never trusted (ADR-0002).
+    // Parsed defensively so an invalid value never rejects the event.
+    cost: z.unknown().optional(),
     tokens: z
       .object({
         input: finiteNumber,
@@ -155,6 +162,8 @@ export interface AssistantSnapshot {
 export interface TrackerOptions {
   transport: LangfuseTransport
   policy: CapturePolicy
+  /** Self-computed cost (feature-005); one resolver per plugin lifetime. */
+  pricing: PricingResolver
   flushDelayMs?: number
   shutdownTimeoutMs?: number
   newId?: () => string
@@ -274,6 +283,15 @@ function truncate(value: string, maxLength: number): string {
   return value.length > maxLength ? `${value.slice(0, maxLength)}... [truncated]` : value
 }
 
+/**
+ * Host-reported cost is diagnostic metadata only (ADR-0002): accepted when
+ * finite and nonnegative, ignored otherwise — an invalid value never rejects
+ * otherwise valid tokens or terminal state.
+ */
+function diagnosticHostCost(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
 /** Limits + redaction applied before recovered root content is retained. */
 function boundRecovered(value: string): string {
   return truncate(value, MAX_STRING_LENGTH)
@@ -282,6 +300,7 @@ function boundRecovered(value: string): string {
 export function createTracker(options: TrackerOptions): Tracker {
   const transport = options.transport
   const policy = options.policy
+  const pricing = options.pricing
   const flushDelayMs = options.flushDelayMs ?? FLUSH_GRACE_MS
   const shutdownTimeoutMs = options.shutdownTimeoutMs ?? SHUTDOWN_TIMEOUT_MS
   const newId = options.newId ?? randomUUID
@@ -656,12 +675,12 @@ export function createTracker(options: TrackerOptions): Tracker {
     // Terminal-state update (with finish reason) is what triggers the export.
   }
 
-  function handleStepEnded(
+  async function handleStepEnded(
     st: SessionState,
     data: z.infer<typeof stepEndedSchema>,
     created: number,
     recoveredStreamedAt: number | undefined,
-  ): void {
+  ): Promise<void> {
     const observationId = primaryObservationId(st.sessionID, data.assistantMessageID)
     const entry = st.generations.get(observationId)
     if (!entry || entry.record.captureStatus !== "running") {
@@ -674,6 +693,10 @@ export function createTracker(options: TrackerOptions): Tracker {
       reasoning: data.tokens.reasoning,
       cacheRead: data.tokens.cache.read,
       cacheWrite: data.tokens.cache.write,
+    }
+    const hostCost = diagnosticHostCost(data.cost)
+    if (hostCost !== undefined) {
+      entry.record.hostCost = hostCost
     }
     entry.record.captureStatus = "completed"
     if (entry.record.endTime === undefined) {
@@ -688,11 +711,10 @@ export function createTracker(options: TrackerOptions): Tracker {
       }
     }
     entry.recoveredStreamedAt = undefined
-    entry.dirty = true
-    requestExport(st)
+    await attachPricing(st, entry)
   }
 
-  function handleStepFailed(st: SessionState, data: z.infer<typeof stepFailedSchema>, created: number): void {
+  async function handleStepFailed(st: SessionState, data: z.infer<typeof stepFailedSchema>, created: number): Promise<void> {
     const observationId = primaryObservationId(st.sessionID, data.assistantMessageID)
     const entry = st.generations.get(observationId)
     if (!entry || entry.record.captureStatus !== "running") {
@@ -702,6 +724,10 @@ export function createTracker(options: TrackerOptions): Tracker {
     entry.record.endTime = created
     entry.record.endBoundary = "session.step.failed"
     entry.record.statusMessage = truncate(String(data.error?.message ?? "step failed"), DIAGNOSTIC_LIMIT)
+    const hostCost = diagnosticHostCost(data.cost)
+    if (hostCost !== undefined) {
+      entry.record.hostCost = hostCost
+    }
     if (data.tokens !== undefined) {
       // Partial usage the provider reported before the failure, verbatim.
       entry.record.usage = {
@@ -712,7 +738,30 @@ export function createTracker(options: TrackerOptions): Tracker {
         cacheWrite: data.tokens.cache.write,
       }
     }
-    // Host cost is never imported (feature-005 computes cost itself).
+    await attachPricing(st, entry)
+  }
+
+  /**
+   * Prices once from the entry's own model and usage; the dirty flag and
+   * export request land when resolution finishes, so the per-session chain
+   * (and any held export or flush drain) waits for the quote. Other sessions,
+   * the event iterator, and provider-byte delivery are never delayed. A
+   * quote that resolves after closing creates no records, timers, or exports.
+   */
+  async function attachPricing(st: SessionState, entry: GenEntry): Promise<void> {
+    const { model, usage } = entry.record
+    if (model === undefined || usage === undefined) {
+      entry.dirty = true
+      requestExport(st)
+      return
+    }
+    const quote = await pricing.price(model, usage)
+    if (closed) {
+      return
+    }
+    if (quote !== undefined) {
+      entry.record.pricing = quote
+    }
     entry.dirty = true
     requestExport(st)
   }
@@ -1103,7 +1152,7 @@ export function createTracker(options: TrackerOptions): Tracker {
               }
               recoveredStreamedAt = recovered.recoveredStreamedAt
             }
-            handleStepEnded(st, parsed.data, created, recoveredStreamedAt)
+            await handleStepEnded(st, parsed.data, created, recoveredStreamedAt)
             break
           }
           case "session.step.failed": {
@@ -1119,7 +1168,7 @@ export function createTracker(options: TrackerOptions): Tracker {
                 return
               }
             }
-            handleStepFailed(st, parsed.data, created)
+            await handleStepFailed(st, parsed.data, created)
             break
           }
         }

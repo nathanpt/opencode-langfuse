@@ -3,15 +3,17 @@
  * GENERATION event, adapted from omp-langfuse's generation handler shape (not
  * its role machinery, matching heuristics, or OTel runtime).
  *
- * Primary generations carry normalized token usage (`usageDetails`) from the
- * durable step events; no model input/output and no cost (feature-005) —
- * never provider request/response bodies.
+ * Primary generations carry normalized token usage (`usageDetails`) and the
+ * independently computed `costDetails` quote (feature-005) from the durable
+ * step events; host cost never substitutes for either — never provider
+ * request/response bodies.
  */
 
 import { applyCapturePolicy, type CapturePolicy } from "./capture-policy.js"
 import { GENERATION_NAME } from "./constants.js"
 import type { IngestEvent } from "./langfuse.js"
-import { redactString } from "./redaction.js"
+import type { GenerationPricing } from "./pricing.js"
+import { redactString, redactValue } from "./redaction.js"
 
 export type GenerationKind = "primary" | "title" | "compaction" | "generate"
 
@@ -51,6 +53,10 @@ export interface GenerationRecord {
   finishReason?: string
   /** Primary only: normalized token usage reported by OpenCode for this request. */
   usage?: GenerationUsage
+  /** Primary only: the independently computed cost quote; absent when unpriced. */
+  pricing?: GenerationPricing
+  /** Primary only: host-reported cost — diagnostic metadata, never an arithmetic input. */
+  hostCost?: number
   /** Auxiliary only: observed HTTP response status. */
   httpStatus?: number
   /** Which observed signal produced endTime; absent when endTime is unknown. */
@@ -134,6 +140,26 @@ export function buildGenerationEvent(
   } else if (record.httpStatus !== undefined) {
     metadata.httpStatus = record.httpStatus
   }
+  if (record.kind === "primary" && record.hostCost !== undefined) {
+    // Host cost is diagnostic only (0 for unpriced models, cache terms dropped
+    // for priced ones); the exported cost below is computed independently.
+    metadata.hostCost = record.hostCost
+  }
+  if (record.pricing !== undefined) {
+    metadata.pricingSource = record.pricing.source
+    if (record.pricing.source === "catalog") {
+      metadata.pricingTier = 0
+      if (record.pricing.tierCount !== undefined) {
+        metadata.pricingTierCount = record.pricing.tierCount
+      }
+      if (record.pricing.firstTierApproximation) {
+        metadata.pricingTierApproximation = "first-tier"
+      }
+    }
+    if (record.pricing.assumption === "off-peak") {
+      metadata.pricingAssumption = "off-peak"
+    }
+  }
 
   const captured = applyCapturePolicy({ metadata }, policy)
 
@@ -181,6 +207,34 @@ export function buildGenerationEvent(
       usageDetails.cacheWrite = u.cacheWrite
     }
     body.usageDetails = usageDetails
+  }
+  // Cost is the stored, once-computed quote — no recomputation at export or
+  // retry time. Host cost is diagnostic only; the exported manual cost is
+  // independently computed from usage and a resolved price (feature-005).
+  if (record.pricing !== undefined) {
+    const c = record.pricing.costDetails
+    const costDetails: Record<string, number> = {}
+    if (Number.isFinite(c.input)) {
+      costDetails.input = c.input
+    }
+    if (Number.isFinite(c.output)) {
+      costDetails.output = c.output
+    }
+    if (c.reasoning !== undefined && Number.isFinite(c.reasoning)) {
+      costDetails.reasoning = c.reasoning
+    }
+    if (c.cacheRead !== undefined && Number.isFinite(c.cacheRead)) {
+      costDetails.cacheRead = c.cacheRead
+    }
+    if (c.cacheWrite !== undefined && Number.isFinite(c.cacheWrite)) {
+      costDetails.cacheWrite = c.cacheWrite
+    }
+    if (Number.isFinite(c.total)) {
+      costDetails.total = c.total
+    }
+    if (Object.keys(costDetails).length > 0) {
+      body.costDetails = redactValue(costDetails)
+    }
   }
   if (statusMessage !== undefined) {
     body.statusMessage = redactString(statusMessage)
