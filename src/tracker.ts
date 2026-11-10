@@ -76,6 +76,12 @@ const stepKeySchema = z.object({
 const stepEndedSchema = stepKeySchema.and(
   z.object({
     finish: z.string(),
+    tokens: z.object({
+      input: finiteNumber,
+      output: finiteNumber,
+      reasoning: finiteNumber,
+      cache: z.object({ read: finiteNumber, write: finiteNumber }),
+    }),
   }),
 )
 
@@ -84,6 +90,14 @@ const stepFailedSchema = stepKeySchema.and(
     error: z
       .object({ message: z.string().optional() })
       .loose()
+      .optional(),
+    tokens: z
+      .object({
+        input: finiteNumber,
+        output: finiteNumber,
+        reasoning: finiteNumber,
+        cache: z.object({ read: finiteNumber, write: finiteNumber }),
+      })
       .optional(),
   }),
 )
@@ -654,6 +668,13 @@ export function createTracker(options: TrackerOptions): Tracker {
       return
     }
     entry.record.finishReason = data.finish
+    entry.record.usage = {
+      input: data.tokens.input,
+      output: data.tokens.output,
+      reasoning: data.tokens.reasoning,
+      cacheRead: data.tokens.cache.read,
+      cacheWrite: data.tokens.cache.write,
+    }
     entry.record.captureStatus = "completed"
     if (entry.record.endTime === undefined) {
       // No measured stream boundary: fall back to the transcript's streamed
@@ -681,7 +702,17 @@ export function createTracker(options: TrackerOptions): Tracker {
     entry.record.endTime = created
     entry.record.endBoundary = "session.step.failed"
     entry.record.statusMessage = truncate(String(data.error?.message ?? "step failed"), DIAGNOSTIC_LIMIT)
-    // Host cost/tokens are never imported into this feature's output.
+    if (data.tokens !== undefined) {
+      // Partial usage the provider reported before the failure, verbatim.
+      entry.record.usage = {
+        input: data.tokens.input,
+        output: data.tokens.output,
+        reasoning: data.tokens.reasoning,
+        cacheRead: data.tokens.cache.read,
+        cacheWrite: data.tokens.cache.write,
+      }
+    }
+    // Host cost is never imported (feature-005 computes cost itself).
     entry.dirty = true
     requestExport(st)
   }

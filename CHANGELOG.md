@@ -7,6 +7,12 @@ All notable changes to this project are documented in this file. Format based on
 
 ### Added
 
+- Token usage on generations (feature-004): primary generations carry `usageDetails`
+  (input/output/total plus non-zero reasoning/cacheRead/cacheWrite) taken verbatim from the
+  durable `session.step.ended` token totals — OpenCode's R1-decided capture point; partial usage
+  from `session.step.failed` is included when reported. Auxiliary generations carry no usage
+  (no capture point, never guessed). Verified live: usage equals OpenCode's normalization of the
+  provider report (prompt−cached, completion−reasoning) on every primary generation.
 - Per-request generation observations (feature-003): one `GENERATION` per primary agent-loop
   model request — acquired from durable `session.step.*` identity, carrying the request's actual
   model reference, finish reason, and the measured response-body terminal boundary — plus

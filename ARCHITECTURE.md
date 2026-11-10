@@ -60,9 +60,10 @@ scores (`tool_call_count`, `turn_count`, `total_tool_errors`, `tool_success_rate
 
 Implemented so far: the trace/root with **deterministic identity** derived from the session id
 (ADR-0003), one generation per primary request acquired from durable `session.step.*` identity,
-and tagged auxiliary generations acquired from `http.request`/`http.response` via exact
-`Request` identity (demand-driven body observer, full-completion timing). Still to come: token
-usage (004), self-computed cost (005), compaction spans (007), scores (009), child traces (013).
+tagged auxiliary generations acquired from `http.request`/`http.response` via exact
+`Request` identity (demand-driven body observer, full-completion timing), and token `usageDetails`
+on primary generations from the R1 capture point (ADR-0002). Still to come: self-computed cost
+(005), compaction spans (007), scores (009), child traces (013).
 
 ## Design decisions (all five resolved 2026-11-09)
 

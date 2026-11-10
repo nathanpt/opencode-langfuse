@@ -48,7 +48,7 @@
         "Verify each primary generation carries usageDetails (input/output, cache fields where the provider reports them) matching the usage OpenCode reports for that request",
         "Verify usage comes from the capture point decided in R1, not guessed"
       ],
-      "passes": false,
+      "passes": true,
       "priority": 1,
       "dependencies": ["feature-003"]
     },

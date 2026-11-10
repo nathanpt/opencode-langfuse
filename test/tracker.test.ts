@@ -118,14 +118,31 @@ function stepStreamed(assistantMessageID: string, created: number, seq?: number)
 }
 
 function stepEnded(assistantMessageID: string, finish: string, created: number, seq?: number): EventInput {
-  return ev("session.step.ended", created, { sessionID: SID, assistantMessageID, finish, cost: 5, tokens: { input: 9 } }, seq)
+  return ev(
+    "session.step.ended",
+    created,
+    {
+      sessionID: SID,
+      assistantMessageID,
+      finish,
+      cost: 5,
+      tokens: { input: 37, output: 5, reasoning: 2, cache: { read: 5, write: 0 } },
+    },
+    seq,
+  )
 }
 
 function stepFailed(assistantMessageID: string, message: string, created: number, seq?: number): EventInput {
   return ev(
     "session.step.failed",
     created,
-    { sessionID: SID, assistantMessageID, error: { type: "provider", message }, cost: 3, tokens: { input: 2 } },
+    {
+      sessionID: SID,
+      assistantMessageID,
+      error: { type: "provider", message },
+      cost: 3,
+      tokens: { input: 4, output: 0, reasoning: 0, cache: { read: 1, write: 0 } },
+    },
     seq,
   )
 }
@@ -254,7 +271,7 @@ test("primary endTime is the stream boundary even when tool settlement lags", as
   assert.equal(metaOf(gen).finishReason, "tool-calls")
 })
 
-test("step.failed produces an error generation with redacted safe text and no host cost/tokens", async () => {
+test("step.failed produces an error generation with redacted text, partial usage, and no host cost", async () => {
   const transport = fakeTransport()
   const tracker = makeTracker(transport)
   tracker.handleEvent(inboxPrompt("p"))
@@ -269,10 +286,34 @@ test("step.failed produces an error generation with redacted safe text and no ho
   assert.equal(gen.body.statusMessage, "provider said SECRET_TOKEN=[REDACTED_SECRET]")
   const wire = JSON.stringify(gen)
   assert.ok(!wire.includes("supersecretvalue"))
-  assert.ok(!wire.includes("cost"))
-  assert.ok(!wire.includes("tokens"))
+  assert.ok(!wire.includes("cost"), "host cost is never imported (feature-005)")
+  const usage = gen.body.usageDetails as Record<string, number>
+  assert.deepEqual(usage, { input: 4, output: 0, total: 5, cacheRead: 1 }, "partial usage from the failure event")
   assert.ok(!("input" in gen.body))
   assert.ok(!("output" in gen.body))
+})
+
+test("primary generations carry usageDetails matching the durable step tokens", async () => {
+  const transport = fakeTransport()
+  const tracker = makeTracker(transport)
+  tracker.handleEvent(inboxPrompt("p"))
+  tracker.handleEvent(stepStarted("msg_u", { seq: 2 }))
+  tracker.handleEvent(stepEnded("msg_u", "stop", BASE + 300, 3))
+  tracker.handleEvent(executionSucceeded(BASE + 400, 4))
+  await tracker.flushAll()
+
+  const events = flatten(transport)
+  const gen = generationsOf(events).find((e) => e.body.name === "llm-generation")
+  assert.ok(gen)
+  assert.deepEqual(
+    gen.body.usageDetails,
+    { input: 37, output: 5, total: 49, reasoning: 2, cacheRead: 5 },
+    "zeros omitted; total sums the normalized parts; usage comes from session.step.ended",
+  )
+  const aux = generationsOf(events).filter((e) => e.body.name !== "llm-generation")
+  for (const a of aux) {
+    assert.ok(!("usageDetails" in a.body), "auxiliary generations carry no guessed usage")
+  }
 })
 
 test("events arriving while the cold-load lookup is pending are all retained", async () => {

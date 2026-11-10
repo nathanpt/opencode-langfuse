@@ -3,8 +3,9 @@
  * GENERATION event, adapted from omp-langfuse's generation handler shape (not
  * its role machinery, matching heuristics, or OTel runtime).
  *
- * This slice captures metadata only — never model input/output, provider
- * request/response bodies, token usage, or cost (features 004/005).
+ * Primary generations carry normalized token usage (`usageDetails`) from the
+ * durable step events; no model input/output and no cost (feature-005) —
+ * never provider request/response bodies.
  */
 
 import { applyCapturePolicy, type CapturePolicy } from "./capture-policy.js"
@@ -23,6 +24,17 @@ export interface ModelReference {
 /** Why a generation's wire payload looks the way it does. */
 export type CaptureStatus = "running" | "completed" | "error" | "cancelled" | "interrupted" | "unavailable"
 
+/** Normalized per-request token usage (OpenCode's `session.step.ended` shape). */
+export interface GenerationUsage {
+  /** Non-cached prompt tokens. */
+  input: number
+  /** Non-reasoning completion tokens. */
+  output: number
+  reasoning?: number
+  cacheRead?: number
+  cacheWrite?: number
+}
+
 export interface GenerationRecord {
   observationId: string
   /** The OpenCode session this generation belongs to (survives as metadata.sessionId). */
@@ -37,6 +49,8 @@ export interface GenerationRecord {
   /** Primary only: the assistant message the request belongs to. */
   assistantMessageID?: string
   finishReason?: string
+  /** Primary only: normalized token usage reported by OpenCode for this request. */
+  usage?: GenerationUsage
   /** Auxiliary only: observed HTTP response status. */
   httpStatus?: number
   /** Which observed signal produced endTime; absent when endTime is unknown. */
@@ -147,6 +161,26 @@ export function buildGenerationEvent(
   // session default, or another request's model.
   if (record.model?.id !== undefined) {
     body.model = record.model.id
+  }
+  // Normalized token usage as reported by OpenCode's durable step events; never
+  // derived from provider payloads or guessed for requests without step events.
+  if (record.usage !== undefined) {
+    const u = record.usage
+    const usageDetails: Record<string, number> = {
+      input: u.input,
+      output: u.output,
+      total: u.input + u.output + (u.reasoning ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0),
+    }
+    if (u.reasoning) {
+      usageDetails.reasoning = u.reasoning
+    }
+    if (u.cacheRead) {
+      usageDetails.cacheRead = u.cacheRead
+    }
+    if (u.cacheWrite) {
+      usageDetails.cacheWrite = u.cacheWrite
+    }
+    body.usageDetails = usageDetails
   }
   if (statusMessage !== undefined) {
     body.statusMessage = redactString(statusMessage)

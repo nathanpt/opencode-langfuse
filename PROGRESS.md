@@ -4,7 +4,8 @@
 
 - Branch `master`. Foundation committed (030160b); features 001, 002, 010 implemented and
   committed after live verification (per-feature commit policy, operator-approved 2026-11-09);
-  feature-003 implemented and live-verified 2026-11-09 (this change).
+  feature-003 implemented and live-verified 2026-11-09; feature-004 implemented and
+  live-verified 2026-11-09 (this change).
 
 ## Confirmed working surfaces
 
@@ -39,8 +40,16 @@
   spans); provider HTTP 400 → `ERROR` generation; model switch adds a `mock-2` primary without
   rewriting earlier `mock-1`; server restart reuses the same trace/root and preserves the
   original root input; `metadata-only` exports no content while the client receives the normal
-  answer. `usageDetails`/`costDetails` absent from submitted payloads (features 004/005).
-- `npm run typecheck` (clean) and `npm test` (48/48) green; `npm run build` produces
+  answer. No `costDetails` in submitted payloads (feature-005).
+- **feature-004 (passing, live-verified 2026-11-09, trace
+  `c35c02ecde39679ea8ace12eb65b5440` / session `ses_e3cf15027ffehOvfaEDARrfSUP`):** primary
+  generations carry `usageDetails {input: 37, output: 5, total: 49, reasoning: 2, cacheRead: 5}`
+  (cacheWrite omitted as zero) — exactly OpenCode's normalization of the provider report
+  (prompt 42 − cached 5, completion 7 − reasoning 2) from the R1 capture point
+  (`session.step.ended`); partial usage from `session.step.failed` included when reported;
+  auxiliary generations carry no plugin-supplied usage. `costDetails` still absent
+  (feature-005).
+- `npm run typecheck` (clean) and `npm test` (49/49) green; `npm run build` produces
   `dist/index.js` (~1.8 MB, self-contained).
 - Verification harness: scratch project `/tmp/oc-feature003` (mock OpenAI-compatible provider on
   `127.0.0.1:18123` from `/tmp/oc-feature003/mock-server.mjs`, built plugin under
@@ -75,8 +84,8 @@
 
 ## Active work
 
-- **feature-004** — usage export (`usageDetails` from durable step totals; no cost math here).
-- **feature-005** — self-computed cost per ADR-0002 on top of feature-004's usage.
+- **feature-005** — self-computed cost per ADR-0002 (`costDetails` = usage × resolved price;
+  layered resolution; one-time warning for unpriced models; host `cost` never trusted).
 
 ## Blockers and unknowns
 
@@ -89,10 +98,11 @@
 - feature-010: passing (live evidence, 2026-11-09).
 - feature-002: passing (live evidence 2026-11-09; identity mechanics superseded by ADR-0003).
 - feature-003: passing (live evidence above, 2026-11-09; ADR-0003).
-- Features 004–013: failing/unverified (see docs/feature-list.json).
+- feature-004: passing (live evidence above, 2026-11-09; capture point per ADR-0002/R1).
+- Features 005–013: failing/unverified (see docs/feature-list.json).
 
 ## Next useful move
 
-- Implement feature-004: attach token `usageDetails` to each generation from the durable
-  `session.step.ended` token totals (no provider-body parsing), then feature-005 pricing per
-  ADR-0002. Both must keep the redaction/preset contract and be live-verified before passing.
+- Implement feature-005: self-computed `costDetails` = usage × resolved price (ADR-0002 layer
+  order: config override → catalog tier → bundled table; omit + one-time warning when
+  unresolvable; never trust host `cost`), live-verified on a priced and an unpriced model.
