@@ -203,7 +203,8 @@
 - Verification harness: `/tmp/oc-tier-probe` (mock OpenAI-compatible provider + Langfuse
   forwarding recorder with a scratch-only usage fixture switch on port 18129, gate script
   `gate-check.mjs`; the tier-probe plugin dumps `ctx.model.list()` cost rows at instance
-  load). The earlier harnesses remain: `/tmp/oc-features011-013` (port 18127),
+  load). The earlier harnesses remain: `/tmp/oc-git-channel` (git-channel verification: npm-cli
+  failure logs, consumer add+session evidence), `/tmp/oc-features011-013` (port 18127),
   `/tmp/oc-features006-009` (18126), `/tmp/oc-feature005` (18125), `/tmp/oc-feature003`
   (18123), `/tmp/oc-verify` (8123), `/tmp/r1-probe`.
 
