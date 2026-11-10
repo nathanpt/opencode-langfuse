@@ -284,5 +284,6 @@
   live-verified, committed as 24766cd). The distribution channel is decided and shipped:
   **git** via `https://github.com/nathanpt/opencode-langfuse.git` (public). Consumer path
   verified end-to-end 2026-11-10 (`opencode plugin add <url>` → real session loads the
-  git-installed `dist/index.js`, honest Disabled banner without config). Remaining
-  first-release chores: version tag (`v0.0.1` untagged), CHANGELOG dates at release, README.
+  git-installed `dist/index.js`, honest Disabled banner without config). Released as
+  **v0.0.1** (tag `v0.0.1` on `13ec5ca`, 2026-11-10; CHANGELOG dated). Remaining: README
+  upkeep as the surface evolves.
