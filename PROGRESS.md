@@ -9,8 +9,9 @@
   006–009 implemented and live-verified 2026-11-10 (committed as 5c9864b); features 011–013
   implemented and live-verified 2026-11-10 (committed as 8630e18, 726135a, 3938744). The
   feature list (`docs/feature-list.json`) is complete: features 001–013 all `passes: true`.
-  Out-of-contract maintenance 2026-11-10 (UNCOMMITTED): catalog tier selection implemented and
-  live-verified (ADR-0002 amendment) — the deferred tier-discriminator item is closed.
+  Out-of-contract maintenance 2026-11-10: catalog tier selection implemented and
+  live-verified, committed as 24766cd (ADR-0002 amendment) — the deferred tier-discriminator
+  item is closed.
 
 ## Confirmed working surfaces
 
@@ -240,10 +241,9 @@
 
 ## Active work
 
-- Tier selection implemented and live-verified 2026-11-10 but **uncommitted** (edits to
-  `src/pricing.ts`, `src/generations.ts`, `test/pricing.test.ts`, `test/tracker.test.ts`, plus
-  ADR-0002 amendment, API-reference/R2 + reuse-inventory notes, exec-plan R2 resolution note,
-  CHANGELOG entry). Deterministic suite 197/197 at this tree. Commit on operator request.
+- None in flight. Tier selection implemented, live-verified, and committed (24766cd, 2026-11-10;
+  10 files, 197/197 tests at the committed tree). The feature list is complete and the
+  remaining open item is the distribution channel decision.
 
 ## Blockers and unknowns
 
@@ -273,5 +273,5 @@
 ## Next useful move
 
 - The feature list is complete; the tier-discriminator item is closed (ADR-0002 amendment,
-  live-verified, uncommitted). Remaining operator-driven follow-up: the distribution channel
-  decision (npm vs git), then first-release chores (version, CHANGELOG dates, README).
+  live-verified, committed as 24766cd). Remaining operator-driven follow-up: the distribution
+  channel decision (npm vs git), then first-release chores (version, CHANGELOG dates, README).
