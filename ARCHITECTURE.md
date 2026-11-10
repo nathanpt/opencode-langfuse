@@ -1,9 +1,9 @@
 # ARCHITECTURE.md — opencode-langfuse
 
-Status: implementation phase. Facts are verified against the OpenCode v2 plugin docs (fetched
+Status: implemented. Facts are verified against the OpenCode v2 plugin docs (fetched
 2026-11-09, against installed opencode v2.0.31) and a read of the sibling `omp-langfuse` v0.4.0
-source. Features 001–010 are implemented and live-verified (see PROGRESS.md);
-remaining features and items marked **UNKNOWN** are open work; see docs/feature-list.json.
+source. Features 001–013 are implemented and live-verified (see PROGRESS.md); ADRs 0001–0005
+are accepted (see docs/decisions/). The feature list (docs/feature-list.json) is complete.
 
 ## What this system is
 
@@ -34,25 +34,39 @@ no local storage tier; the only buffering is in-memory between an event and the 
   (object form passes `ctx.options`); `opencode plugin add/list/remove`; watched config dirs hot-
   reload. Local plugins may be `.ts` directly.
 
-## Component map (planned)
+## Component map (implemented)
 
 ```
 setup(ctx)
 ├── config      credentials + options: env vars → 0600 config file    [ADR-0001, accepted]
-├── capture     privacy presets + redaction      port of omp-langfuse capture-policy/redaction
-├── observe     hook/event → observation builders: session, generation, tool, compaction
-├── pricing     price resolution + cost          implemented (src/pricing.ts); layered
-│                                                resolution per ADR-0002, no runtime deps
-├── metadata    git/repo source metadata         via ctx.vcs (replaces sibling's manual git)
-├── transport   Langfuse REST ingestion client + flush/shutdown (scores land with a later feature)
-└── state       per-session state + score aggregation, keyed by sessionID
+│               (src/config.ts); resolved once in setup — the active config
+├── capture     privacy presets + redaction (src/capture-policy.ts, src/redaction.ts);
+│               resolvePrivacyPreset: env-over-file base preset, per-field env overrides
+├── observe     hook/event → observation builders (src/generations.ts, src/tools.ts,
+│               src/compactions.ts, src/auxiliary.ts): session, generation, tool, compaction
+├── pricing     price resolution + cost (src/pricing.ts); layered resolution per ADR-0002,
+│               no runtime deps
+├── source      source/git metadata (src/source-metadata.ts): native ctx.vcs.get
+│               provider/current-branch + bounded read-only Git supplement (work-tree root,
+│               HEAD, origin) + repo-root override file, under one 2s deadline combined with
+│               unload cancellation; collected lazily once per session admission
+│               [ADR-0005, accepted]
+├── transport   Langfuse REST ingestion client (src/langfuse.ts) + flush/shutdown;
+│               onError notices on final failure (retry exhaustion, rejected 207 events)
+├── commands    /langfuse-status + /langfuse-test (src/commands.ts): server-log-only,
+│               report/test the active config, standalone test trace [ADR-0005, accepted]
+├── status      runtime last-error slot (src/runtime-status.ts): scope + redacted ≤300-char
+│               message + timestamp per plugin instance; survives successes until reload
+└── state       per-session state + score aggregation (src/tracker.ts, src/scores.ts),
+                keyed by sessionID; child sessions are admitted like primaries [ADR-0005]
 ```
 
-Dependency direction: `observe` and `metadata` feed `transport` through `state`; `capture` and
+Dependency direction: `observe` and `source` feed `transport` through `state`; `capture` and
 `pricing` are pure functions over payloads; `config` is read once in `setup` and passed down.
-Nothing outside `transport` talks to the network.
+Nothing outside `transport` talks to the network; `commands` only call `transport.ingest` for
+the standalone test trace and never touch `state`.
 
-## Trace model (target)
+## Trace model (implemented)
 
 Same shape as omp-langfuse, renamed for this harness: one trace per session; root observation
 (user prompt → final assistant response); one generation per primary model request; auxiliary
@@ -61,7 +75,7 @@ role tagging); tool observations with `level=ERROR` on failure; a span for compa
 scores (`tool_call_count`, `turn_count`, `total_tool_errors`, `tool_success_rate`,
 `session_had_errors`) attached when the session ends.
 
-Implemented so far: the trace/root with **deterministic identity** derived from the session id
+Implemented: the trace/root with **deterministic identity** derived from the session id
 (ADR-0003), one generation per primary request acquired from durable `session.step.*` identity,
 tagged auxiliary generations acquired from `http.request`/`http.response` via exact
 `Request` identity (demand-driven body observer, full-completion timing), token `usageDetails`
@@ -73,10 +87,35 @@ diagnostic `metadata.hostCost`). Root-sibling observations and scores per ADR-00
 call), compaction spans (007 — one content-free span per native lifecycle, deterministic
 identity from the start sequence), and the five cumulative trace scores (008 — published only
 when complete history is provable and every admitted tool has an authoritative terminal;
-omitted with a bounded warning after a compacted cold restore). Still to come: child
-traces (013), source metadata (011), slash commands (012).
+omitted with a bounded warning after a compacted cold restore; a recovered shell exit seeds as
+a failure per the same classification rule).
 
-## Design decisions (all five resolved 2026-11-09)
+Source metadata (011, ADR-0005): trace metadata carries `source_type`, `git_branch` (native
+`ctx.vcs.get` current branch only), `git_commit` (read-only Git), sanitized
+`git_remote_host`/`git_remote_path`, `repo_owner`/`repo_name`/`repo_identity` (or
+`repo_root_name` with no origin), and `metadata_source` (`git-detection` | `repo-file`). A
+repo-root `.opencode-langfuse.metadata.json` may override exactly eight documented keys; the
+engine/trace keys cannot be overridden, and every retained value passes the redactor. Metadata
+rides **trace metadata only** (reasserted on updates); the root observation and child
+observations never gain it. No trustworthy session directory means no fabricated source.
+
+Child-session traces (013, ADR-0005): children are admitted like primaries with unchanged
+identity seeds and export their own trace/root named `opencode-subagent:<agent>` (redacted,
+sanitized, `subagent` fallback), grouped under the **direct parent's** Langfuse session id
+(`trace.sessionId` = parent id), with trace metadata `role:"subagent"`, `parentSessionID`,
+`parent_trace_id` (the parent's deterministic trace id), and `agent` when known. All
+step/tool/compaction/score machinery, pricing, and caps operate on the child's own state;
+parent counts never include child work; a grandchild links to its direct parent.
+
+Operational commands (012, ADR-0005): `/langfuse-status` and `/langfuse-test` are registered
+before the unconfigured early-return, so both exist while tracing is disabled. They are
+server-log-only — no model API, no tracker mutation, no host-conversation change. Status
+reports the active config (state, source, redacted host, masked key, resolved preset, the five
+actual flags) and the retained last runtime error; `/langfuse-test` ingests one standalone
+`opencode-langfuse-test` trace/root per invocation through the active transport, gated by the
+capture policy, with no session grouping or scores.
+
+## Design decisions (research resolutions R1–R5, all resolved 2026-11-09)
 
 1. **Token-usage capture point** — **resolved 2026-11-09 (R1):** the event stream is the source.
    `session.step.ended` fires once per model request (`assistantMessageID`, `finish`, host `cost`,
@@ -88,10 +127,12 @@ traces (013), source metadata (011), slash commands (012).
    **USD per 1M tokens**. Host `cost` is untrustworthy twice over: 0 for unpriced models and
    missing `cache.read` for priced ones. Cost is always self-computed — decision and precedence in
    ADR-0002 (accepted). Known gap: `model.list()` omits config-defined providers' models.
-3. **Subagent/child-session model** — **resolved 2026-11-09 (R3):** subagents are real child
-   sessions; `session.created` carries `parentID`, `agent` (subagent name), and `title`, with the
-   child's own step/usage events. The sibling's `parent_trace_id` grouping **ports**: child traces
-   are named `opencode-subagent:<agent>` and carry `metadata.parentSessionID` = `parentID`.
+3. **Subagent/child-session model** — **resolved 2026-11-09 (R3); implemented 2026-11-10
+   (feature-013, ADR-0005):** subagents are real child sessions; `session.created` carries
+   `parentID`, `agent` (subagent name), and `title`, with the child's own step/usage events.
+   Children are admitted like primaries with unchanged identity seeds; child traces are named
+   `opencode-subagent:<agent>`, carry `metadata.parentSessionID`/`parent_trace_id`/`agent`,
+   and group under the direct parent's Langfuse session id.
 4. **Config & credential storage** — **resolved 2026-11-09 (R4):** env vars first
    (`LANGFUSE_PUBLIC_KEY/SECRET_KEY/BASE_URL|HOST` + capture overrides), then a dedicated 0600
    config file (`~/.config/opencode-langfuse/config.json`, sibling-shaped); `ctx.options`
@@ -108,8 +149,10 @@ traces (013), source metadata (011), slash commands (012).
    function performs the final timeout-bounded shutdown. The transport is REST-only
    (`POST /api/public/ingestion`, one retry, per-event 207 acceptance replaces the sibling's
    OTel queue + REST fallback). `session.created` can race the event subscription on a cold
-   plugin load, so a prompt for an unknown session reconciles via `ctx.session.get` (primaries
-   become records; children stay skipped; lookup failure fails open).
+   plugin load, so a prompt for an unknown session reconciles via `ctx.session.get` (records
+   created with no invented content or linkage; lookup failure fails open). Since feature-013,
+   children are admitted through the same reconciliation and a later birth enriches the same
+   deterministic trace.
 
 ## Where to look next
 
