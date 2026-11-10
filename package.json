@@ -5,16 +5,15 @@
   "type": "module",
   "main": "./dist/index.js",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./dist/index.js"
   },
   "files": [
-    "src",
     "dist"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
-    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/index.js --log-level=warning"
+    "bundle": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/index.js --log-level=warning"
   },
   "keywords": [
     "opencode",
@@ -24,11 +23,9 @@
     "tracing",
     "llm"
   ],
-  "dependencies": {
-    "@opencode/plugin": "latest",
-    "zod": "^4"
-  },
   "devDependencies": {
+    "@opencode/plugin": "latest",
+    "zod": "^4",
     "@types/node": "^22",
     "esbuild": "^0.28.1",
     "tsx": "^4.19.0",

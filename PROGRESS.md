@@ -71,7 +71,7 @@
   per plugin lifetime (cached failure; late settlement inert). Metadata-only restart: fresh
   priced session keeps numeric usage/cost (`0.00011925`, `pricingSource: config`) while trace/
   root/generation content stays absent and the CLI answer is normal.
-- `npm run typecheck` (clean) and `npm test` (148/148) green; `npm run build` produces
+- `npm run typecheck` (clean) and `npm test` (148/148) green; `npm run bundle` produces
   `dist/index.js` (~1.8 MB, self-contained).
 - **feature-006 (passing, live-verified 2026-11-10, harness `/tmp/oc-features006-009`, stage
   `tools`):** one root-parented span per exact tool call, named for the redacted native tool
@@ -267,7 +267,7 @@
 - feature-012: passing (live evidence above, 2026-11-10; ADR-0005).
 - feature-013: passing (live evidence above, 2026-11-10; ADR-0005).
 - tier selection: passing (live evidence above, 2026-11-10; ADR-0002 amendment).
-- Deterministic suite: `npm run typecheck` clean, `npm test` 197/197 green, `npm run build`
+- Deterministic suite: `npm run typecheck` clean, `npm test` 197/197 green, `npm run bundle`
   produces `dist/index.js` (self-contained esbuild node22 bundle).
 
 ## Next useful move

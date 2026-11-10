@@ -35,7 +35,7 @@ opencode run "..."        # one-shot session; used for live verification
 
 Plugin dev loop: place the plugin under `.opencode/plugins/` (auto-discovered) and restart, or
 reference it from `opencode.json(c)`'s `plugins` array; `opencode service restart` reloads watched
-config dirs. Verification: `npm run typecheck && npm test && npm run build` (tsx node:test
+config dirs. Verification: `npm run typecheck && npm test && npm run bundle` (tsx node:test
 suite under `test/`, esbuild node22 bundle to `dist/index.js`).
 
 ### Hard constraints
