@@ -94,6 +94,10 @@ function parseSessionSnapshot(info: unknown, context: unknown): SessionSnapshot 
   if (isRecord(time) && typeof time.created === "number" && Number.isFinite(time.created)) {
     snapshot.createdAt = time.created
   }
+  const agent = info.agent
+  if (typeof agent === "string" && agent.length > 0) {
+    snapshot.agent = agent
+  }
   // The session's own location (nonempty absolute only); never substituted.
   const location = info.location
   if (

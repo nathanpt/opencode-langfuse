@@ -17,7 +17,9 @@ All notable changes to this project are documented in this file. Format based on
   override exactly eight documented keys; engine/trace keys cannot be overridden, unusable
   files are ignored with one fixed diagnostic, and every retained value passes the redactor.
   Metadata rides trace metadata only (reasserted on updates), under every privacy preset; no
-  trustworthy session directory means no fabricated source.
+  trustworthy session directory means no fabricated source. A cold score seed now applies the
+  ADR-0004 rule to recovered shell exits (completed native shell with finite non-zero exit
+  seeds as a failure).
 - Operational commands (feature-012): `/langfuse-status` and `/langfuse-test` are registered
   before the unconfigured early-return, so both exist while tracing is disabled. Commands are
   server-log-only: they never touch the tracker, never drive a model API, and never change the
@@ -33,6 +35,22 @@ All notable changes to this project are documented in this file. Format based on
   final retry exhaustion, 207 partial rejections, diagnostics, failed persists, and shutdown
   drain failures record into the plugin-instance-local slot; capacity/pricing/score-omission
   warnings never do.
+- Child-session traces (feature-013): subagent sessions are admitted like primaries and export
+  their own trace/root named `opencode-subagent:<agent>` (agent redacted, sanitized to
+  `[A-Za-z0-9._-]`, capped at 120, fixed `subagent` fallback), grouped under the **direct
+  parent's** Langfuse session id, with trace metadata `role:"subagent"`,
+  `parentSessionID`, `parent_trace_id` (the parent's deterministic trace id), and `agent`.
+  Identity seeds are unchanged, so all step/tool/compaction/score machinery, pricing, and caps
+  operate on each child independently — parent counts never include child work, and a
+  grandchild links to its direct parent. Native birth facts (`session.created`) enrich states
+  created by failed lookups; conflicts diagnose without reparenting; a late birth corrects an
+  unclassified state under the same deterministic ids. The old child-exclusion machinery
+  (`excludedSessions`/`MAX_EXCLUDED_SESSIONS`) is deleted; children share the existing
+  256-session cap.
+- Decision record ADR-0005 (source metadata, operational commands, and child-session traces):
+  API-plus-Git acquisition and the override whitelist, active-config server-log-only commands
+  with last-error retention, and separate linked child trace identity extending
+  ADR-0001/0003/0004.
 - Tool observations (feature-006): one root-parented span per exact tool call, paired by the
   full `(sessionID, assistantMessageID, toolCallID)` identity with deterministic ids. Failure
   classification follows the operator-selected rule — the `execute.after` error status or a

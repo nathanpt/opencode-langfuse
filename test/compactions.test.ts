@@ -450,18 +450,38 @@ test("buildCompactionEvent update phase omits the parent link and whitelists met
   assert.equal("output" in event.body, false)
 })
 
-test("child sessions never gain compaction spans", async () => {
+test("child sessions gain their own compaction spans under the child trace", async () => {
   const transport = fakeTransport()
   const child = "ses_comp_child"
   const tracker = makeTracker(transport, {
-    lookupSession: async (sessionID) => (sessionID === child ? { parentID: SID } : undefined),
+    lookupSession: async (sessionID) => (sessionID === child ? { parentID: SID, agent: "general" } : undefined),
   })
-  tracker.handleEvent(ev("session.created", BASE, { sessionID: child, parentID: SID }, 0))
+  tracker.handleEvent({
+    type: "session.created",
+    created: BASE,
+    durable: { aggregateID: child, seq: 0, version: 1 },
+    data: { sessionID: child, parentID: SID },
+  })
   tracker.handleEvent(compactionStarted(10, BASE + 300, { sessionID: child }))
   tracker.handleEvent(compactionEnded(11, BASE + 350, { sessionID: child }))
   await tracker.flushNow(child)
   await tracker.flushNow(SID)
-  assert.equal(transport.batches.flat().length, 0)
+
+  const flat = transport.batches.flat()
+  const childTraceId = createHash("sha256").update(`opencode-langfuse:trace:${child}`, "utf8").digest("hex").slice(0, 32)
+  const childRootId = createHash("sha256").update(`opencode-langfuse:root:${child}`, "utf8").digest("hex").slice(0, 16)
+  const spans = compactionSpans(flat)
+  assert.equal(spans.length, 1, "the child's compaction lifecycle exports one span")
+  assert.equal(spans[0].body.id, compactionStartId(child, 10))
+  assert.equal(spans[0].body.traceId, childTraceId)
+  assert.equal(spans[0].body.parentObservationId, childRootId)
+  assert.equal((spans[0].body.metadata as EventInput).sessionId, child)
+  const childTrace = flat.find((e) => e.type === "trace-create" && e.body.id === childTraceId)
+  assert.ok(childTrace)
+  assert.equal(childTrace.body.name, "opencode-subagent:general")
+  assert.equal(childTrace.body.sessionId, SID)
+  // No compaction facts under the parent session id.
+  assert.ok(!flat.some((e) => (e.body.metadata as EventInput)?.sessionId === SID))
 })
 
 test("generationSpans untouched by compaction lifecycle events", async () => {

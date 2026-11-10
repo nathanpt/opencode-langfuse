@@ -8,6 +8,9 @@ export const MAX_OBJECT_KEYS = 80
 /** Name for the per-session trace and its root observation. */
 export const TRACE_NAME = "opencode-agent"
 
+/** Child-session trace/root name prefix; the redacted agent label follows (feature-013). */
+export const SUBAGENT_TRACE_NAME_PREFIX = "opencode-subagent:"
+
 /** Name for the primary agent-loop generation observation. Auxiliary kinds append `:<kind>`. */
 export const GENERATION_NAME = "llm-generation"
 

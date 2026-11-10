@@ -184,7 +184,7 @@
         "Run a session that spawns a subagent (per the R3 findings on OpenCode's child-session model)",
         "Verify child traces are named and grouped under the parent session with parent linkage, or the feature is consciously descoped with the R3 evidence recorded"
       ],
-      "passes": false,
+      "passes": true,
       "priority": 3,
       "dependencies": [
         "feature-003"

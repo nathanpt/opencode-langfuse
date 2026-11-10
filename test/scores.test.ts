@@ -481,3 +481,91 @@ test("snapshot tools with pending status delay publication until a terminal fact
   assert.equal(scores.get("tool_call_count")?.value, 1)
   assert.equal(scores.get("tool_success_rate")?.value, 1)
 })
+
+test("parent and child sessions keep independent score ledgers and identities", async () => {
+  const transport = fakeTransport()
+  const child = "ses_score_child"
+  const tracker = makeTracker(transport, {
+    lookupSession: async (sessionID) =>
+      sessionID === child ? { parentID: SID, agent: "general", scoreHistory: { complete: true, turns: [], tools: [] } } : undefined,
+  })
+  const childEv = (type: string, created: number, data: EventInput, seq: number): EventInput => ({
+    type,
+    created,
+    durable: { aggregateID: child, seq, version: 1 },
+    data,
+  })
+
+  // Parent: one turn, one successful tool, terminal.
+  tracker.handleEvent(sessionCreated())
+  tracker.handleEvent(stepStarted(1, BASE + 200, "msg_p1"))
+  tracker.handleEvent(toolCalled(2, BASE + 210, "call_p", "msg_p1"))
+  tracker.handleEvent(toolSuccess(3, BASE + 260, "call_p", "msg_p1"))
+  tracker.handleEvent(stepEnded(4, BASE + 310, "msg_p1"))
+  tracker.handleEvent(executionSucceeded(BASE + 400, 5))
+  // Child: two turns, one failed tool, terminal.
+  tracker.handleEvent(childEv("session.created", BASE, { sessionID: child, parentID: SID }, 0))
+  tracker.handleEvent(childEv("session.step.started", BASE + 220, { sessionID: child, assistantMessageID: "msg_c1", agent: "general", model: { id: "mock-1", providerID: "mock" }, started: BASE + 219 }, 1))
+  tracker.handleEvent(childEv("session.tool.called", BASE + 230, { sessionID: child, assistantMessageID: "msg_c1", id: "call_c", input: { command: "x" }, executed: false }, 2))
+  tracker.handleEvent(childEv("session.tool.failed", BASE + 280, { sessionID: child, assistantMessageID: "msg_c1", id: "call_c", error: { type: "tool.execution", message: "boom" }, executed: false }, 3))
+  tracker.handleEvent(childEv("session.step.ended", BASE + 320, { sessionID: child, assistantMessageID: "msg_c1", finish: "stop", cost: 5, tokens: { input: 37, output: 5, reasoning: 2, cache: { read: 5, write: 0 } } }, 4))
+  tracker.handleEvent(childEv("session.step.started", BASE + 340, { sessionID: child, assistantMessageID: "msg_c2", agent: "general", model: { id: "mock-1", providerID: "mock" }, started: BASE + 339 }, 5))
+  tracker.handleEvent(childEv("session.step.ended", BASE + 360, { sessionID: child, assistantMessageID: "msg_c2", finish: "stop", cost: 5, tokens: { input: 9, output: 2, reasoning: 0, cache: { read: 0, write: 0 } } }, 6))
+  tracker.handleEvent(childEv("session.execution.succeeded", BASE + 420, { sessionID: child }, 7))
+  await tracker.flushAll()
+
+  const flat = transport.batches.flat()
+  const childTraceId = createHash("sha256").update(`opencode-langfuse:trace:${child}`, "utf8").digest("hex").slice(0, 32)
+  const parentScores = scoreValues(flat.filter((e) => e.body.traceId === expectedTraceId))
+  const childScores = scoreValues(flat.filter((e) => e.body.traceId === childTraceId))
+  assert.equal(parentScores.size, 5)
+  assert.equal(childScores.size, 5)
+  // Parent totals never incorporate child work.
+  assert.equal(parentScores.get("tool_call_count")?.value, 1)
+  assert.equal(parentScores.get("turn_count")?.value, 1)
+  assert.equal(parentScores.get("total_tool_errors")?.value, 0)
+  assert.equal(parentScores.get("tool_success_rate")?.value, 1)
+  assert.equal(parentScores.get("session_had_errors")?.value, 0)
+  // Child totals are its own.
+  assert.equal(childScores.get("tool_call_count")?.value, 1)
+  assert.equal(childScores.get("turn_count")?.value, 2)
+  assert.equal(childScores.get("total_tool_errors")?.value, 1)
+  assert.equal(childScores.get("tool_success_rate")?.value, 0)
+  assert.equal(childScores.get("session_had_errors")?.value, 1)
+  // Score ids stay keyed by each session's own id.
+  for (const name of SCORE_NAMES) {
+    const childRow = childScores.get(name)
+    assert.equal(childRow?.id, scoreId(child, name as never))
+    assert.notEqual(childRow?.id, scoreId(SID, name as never))
+    assert.equal(childRow?.traceId, childTraceId)
+  }
+})
+
+test("a cold seed classifies a completed shell with non-zero exit as a failure", async () => {
+  const transport = fakeTransport()
+  // Complete transcript: one turn whose shell tool completed with exit 7
+  // (native status completed, structured exit — ADR-0004 failure rule).
+  const snapshot: SessionSnapshot = {
+    createdAt: BASE,
+    scoreHistory: {
+      complete: true,
+      turns: ["msg_1"],
+      tools: [{ assistantMessageID: "msg_1", toolCallID: "call_x", name: "shell", status: "completed", exit: 7 }],
+    },
+  }
+  const tracker = makeTracker(transport, { lookupSession: async () => snapshot })
+  // Cold restore: no locally observed birth — the snapshot is the only seed.
+  tracker.handleEvent(inboxPrompt("restored prompt", 1))
+  tracker.handleEvent(executionSucceeded(BASE + 400, 9))
+  await tracker.flushNow(SID)
+
+  const scores = scoreValues(transport.batches.flat())
+  assert.equal(scores.get("tool_call_count")?.value, 1)
+  assert.equal(scores.get("total_tool_errors")?.value, 1, "seeded exit-7 shell counts as the authoritative failure")
+  assert.equal(scores.get("tool_success_rate")?.value, 0)
+  assert.equal(scores.get("session_had_errors")?.value, 1)
+  assert.equal(scores.get("turn_count")?.value, 1)
+  for (const name of SCORE_NAMES) {
+    assert.equal(scores.get(name)?.id, scoreId(SID, name as never))
+  }
+})

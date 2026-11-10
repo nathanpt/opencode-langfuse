@@ -631,21 +631,36 @@ test("tool capacity refusal refuses telemetry once per episode and resets after 
   assert.equal(toolSpans(transport.batches.flat()).filter((e) => (e.body.metadata as EventInput).toolCallID === "call_overflow").length, 0)
 })
 
-test("child sessions produce no tool telemetry", async () => {
+test("child sessions produce tool telemetry under their own trace", async () => {
   const transport = fakeTransport()
   const childSession = "ses_child_1"
   const tracker = makeTracker(transport, {
     lookupSession: async (sessionID): Promise<SessionSnapshot | undefined> =>
-      sessionID === childSession ? { parentID: SID } : undefined,
+      sessionID === childSession ? { parentID: SID, agent: "general" } : undefined,
   })
   tracker.handleEvent(evFor(childSession, "session.created", BASE, { sessionID: childSession, parentID: SID }, 0))
-  tracker.handleEvent(toolCalled({ sessionID: childSession, id: "call_1", seq: 1, created: BASE + 210 }))
-  tracker.handleEvent(toolSuccess({ sessionID: childSession, id: "call_1", seq: 2, created: BASE + 260 }))
+  tracker.handleEvent(toolInputStarted("shell", { sessionID: childSession, id: "call_1", seq: 1 }))
+  tracker.handleEvent(toolCalled({ sessionID: childSession, id: "call_1", seq: 2, created: BASE + 210 }))
+  tracker.handleEvent(toolSuccess({ sessionID: childSession, id: "call_1", seq: 3, created: BASE + 260 }))
   await tracker.flushNow(childSession)
   await tracker.flushNow(SID)
 
-  assert.equal(toolSpans(transport.batches.flat()).length, 0)
-  assert.equal(transport.batches.flat().length, 0)
+  const flat = transport.batches.flat()
+  const childTraceId = createHash("sha256").update(`opencode-langfuse:trace:${childSession}`, "utf8").digest("hex").slice(0, 32)
+  const childRootId = createHash("sha256").update(`opencode-langfuse:root:${childSession}`, "utf8").digest("hex").slice(0, 16)
+  const spans = toolSpans(flat)
+  assert.equal(spans.length, 1, "the child's own tool call produces exactly one span")
+  assert.equal(spans[0].body.id, toolObservationId(childSession, "msg_1", "call_1"))
+  assert.equal(spans[0].body.traceId, childTraceId)
+  assert.equal(spans[0].body.parentObservationId, childRootId)
+  // No parent contamination: no span or observation under the parent session.
+  assert.ok(!flat.some((e) => e.body.id === toolObservationId(SID, "msg_1", "call_1")))
+  const childTrace = flat.find((e) => e.type === "trace-create" && e.body.id === childTraceId)
+  assert.ok(childTrace)
+  assert.equal(childTrace.body.name, "opencode-subagent:general")
+  assert.equal(childTrace.body.sessionId, SID, "child groups under the direct parent session")
+  assert.equal((childTrace.body.metadata as EventInput).parentSessionID, SID)
+  assert.equal((childTrace.body.metadata as EventInput).parent_trace_id, createHash("sha256").update(`opencode-langfuse:trace:${SID}`, "utf8").digest("hex").slice(0, 32))
 })
 
 test("shutdown marks running tools interrupted under the plugin.shutdown boundary", async () => {

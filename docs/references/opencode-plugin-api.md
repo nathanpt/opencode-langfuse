@@ -197,3 +197,14 @@ loads fine) observed real sessions against a local OpenAI-compatible mock. Raw e
 - `session.created` child births carry `parentID`, `agent`, and `title` directly in `data`
   (R3), and children emit their own `session.step.*`/`session.execution.*` events.
 
+### Live findings during features 011–013 verification (2026-11-10, v2.0.31)
+
+- `GET /api/command` lists **config-defined commands only**; commands registered through
+  `ctx.command.transform` are invocable via `POST /api/session/<SID>/command` (204 on success)
+  but absent from that listing. Discovery in verification therefore asserts invocation, not
+  listing.
+- `ctx.vcs.get` can return an empty `Vcs.Info` (`provider`/`branch` unset) before the
+  location's VCS provider has initialized; a moment later the same call returns
+  `{provider:"git", branch:{current,…}}`. Verification evidence retries briefly; the tracker's
+  single bounded collection observed populated facts in every live run.
+

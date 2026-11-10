@@ -1,8 +1,11 @@
 /**
  * Per-session trace state, generation acquisition, and export lifetime.
  *
- * One trace per primary OpenCode session (children are feature-013). Identity
- * is deterministic from the session id, so a continued, flushed, or
+ * One trace per OpenCode session: child sessions (subagents) are admitted
+ * like primaries and export their own trace/root named
+ * `opencode-subagent:<agent>`, grouped under the direct parent's Langfuse
+ * session id and linked by trace metadata (feature-013). Identity is
+ * deterministic from the session id, so a continued, flushed, or
  * reconstructed session reuses the same trace/root/generation ids. The
  * durable event stream is the only truth for primaries
  * (`session.step.*`, `session.execution.*`, prompts, final assistant text);
@@ -28,6 +31,7 @@ import {
   MAX_TRACKED_SESSIONS,
   ROOT_SEED_PREFIX,
   SHUTDOWN_TIMEOUT_MS,
+  SUBAGENT_TRACE_NAME_PREFIX,
   TRACE_NAME,
   TRACE_SEED_PREFIX,
 } from "./constants.js"
@@ -254,6 +258,8 @@ export interface SessionSnapshot {
   parentID?: string
   /** The session's own working directory (nonempty absolute path only). */
   directory?: string
+  /** The session's agent name (nonempty only), native birth or Session.Info. */
+  agent?: string
   createdAt?: number
   firstPrompt?: string
   latestAssistantOutput?: string
@@ -296,7 +302,7 @@ export interface TrackerOptions {
   log?: (message: string) => void
   /** Plugin runtime-error notice from diagnostics, failed persists, and the shutdown drain (feature-012). */
   onError?: (message: string) => void
-  /** Cold-load reconciliation: children (parentID) are skipped; failure fails open. */
+  /** Cold-load reconciliation: children are admitted like primaries; failure fails open. */
   lookupSession?(sessionID: string): Promise<SessionSnapshot | undefined>
   /** Bounded collection of source facts for a session's own directory (feature-011). */
   lookupSourceMetadata?(directory: string): Promise<SourceMetadata>
@@ -386,6 +392,10 @@ interface SessionState {
   /** Detached sanitized source facts, collected once per admission (feature-011). */
   sourceMetadata?: SourceMetadata
   sourceMetadataAttempted?: boolean
+  /** Direct parent session id when native sources identify a child (feature-013). */
+  parentID?: string
+  /** Redacted, bounded subagent name for child traces (feature-013). */
+  agent?: string
   rootDirty: boolean
   rootExported: boolean
   rootEndedAt?: number
@@ -466,7 +476,6 @@ const SELECTED_EVENT_TYPES: Record<string, true> = {
 }
 
 const MAX_SEEN_SEQS = 8192
-const MAX_EXCLUDED_SESSIONS = 1024
 const DIAGNOSTIC_LIMIT = 300
 
 function noop(): void {}
@@ -501,6 +510,21 @@ function birthDirectory(data: Record<string, unknown>): string | undefined {
   const location = isRecord(data.location) ? data.location : undefined
   const directory = location?.directory
   return typeof directory === "string" && directory.length > 0 && isAbsolute(directory) ? directory : undefined
+}
+
+/**
+ * Child trace label (feature-013): the agent name passes the redactor, then
+ * every character outside `[A-Za-z0-9._-]` becomes `_`, capped at 120.
+ * Empty/all-underscore results use the fixed `subagent` fallback.
+ */
+function subagentLabel(agent: string | undefined): string {
+  const sanitized =
+    typeof agent === "string"
+      ? String(redactValue(agent))
+          .replace(/[^A-Za-z0-9._-]/g, "_")
+          .slice(0, 120)
+      : ""
+  return sanitized.length === 0 || /^_+$/.test(sanitized) ? "subagent" : sanitized
 }
 
 /** Limits + redaction applied before recovered root content is retained. */
@@ -542,7 +566,6 @@ export function createTracker(options: TrackerOptions): Tracker {
   const states = new Map<string, SessionState>()
   const stateChains = new Map<string, Promise<void>>()
   const exportChains = new Map<string, Promise<void>>()
-  const excludedSessions = new Set<string>()
   const sessionCapacityWarned = new Set<string>()
   // Queued-but-unfinished state work per session, tracked outside the state
   // record so pre-state enqueues and in-flight reconciles are never mistaken
@@ -844,6 +867,12 @@ export function createTracker(options: TrackerOptions): Tracker {
     if (typeof snapshot?.directory === "string" && st.directory === undefined) {
       st.directory = snapshot.directory
     }
+    if (typeof snapshot?.parentID === "string" && mergeParentFact(st, snapshot.parentID, "session.info")) {
+      st.rootDirty = true
+    }
+    if (mergeAgentFact(st, snapshot?.agent)) {
+      st.rootDirty = true
+    }
     if (snapshot?.firstPrompt !== undefined && st.firstPrompt === undefined) {
       st.firstPrompt = boundRecovered(snapshot.firstPrompt)
     }
@@ -852,11 +881,59 @@ export function createTracker(options: TrackerOptions): Tracker {
     }
   }
 
-  /** Native birth facts enrich an existing state without erasing known values. */
-  function mergeBirthDirectory(st: SessionState, birth: Pick<SessionSnapshot, "directory"> | undefined): void {
+  /** Redacted, bounded agent name retained on child state. */
+  function boundedAgentName(value: string): string {
+    return truncate(String(redactValue(value)), 120)
+  }
+
+  /**
+   * First known nonempty parent wins; a self reference is ignored and a
+   * conflict diagnoses without reparenting (feature-013).
+   */
+  function mergeParentFact(st: SessionState, candidate: string, source: string): boolean {
+    if (candidate.length === 0) {
+      return false
+    }
+    if (candidate === st.sessionID) {
+      diagnostic(`session ${st.sessionID} reported itself as its own parent (${source}); ignored`)
+      return false
+    }
+    if (st.parentID === undefined) {
+      st.parentID = candidate
+      return true
+    }
+    if (st.parentID !== candidate) {
+      diagnostic(`session ${st.sessionID} parent conflict: keeping ${st.parentID}, ignoring ${candidate} (${source})`)
+    }
+    return false
+  }
+
+  /** Missing values never erase an established name. */
+  function mergeAgentFact(st: SessionState, candidate: string | undefined): boolean {
+    if (typeof candidate !== "string" || candidate.length === 0 || st.agent !== undefined) {
+      return false
+    }
+    st.agent = boundedAgentName(candidate)
+    return true
+  }
+
+  /** Native birth facts enrich a state without erasing known values. */
+  function mergeBirthFacts(
+    st: SessionState,
+    birth: Pick<SessionSnapshot, "directory" | "parentID" | "agent"> | undefined,
+  ): boolean {
+    let changed = false
     if (st.directory === undefined && typeof birth?.directory === "string" && birth.directory.length > 0) {
       st.directory = birth.directory
+      changed = true
     }
+    if (typeof birth?.parentID === "string" && mergeParentFact(st, birth.parentID, "session.created")) {
+      changed = true
+    }
+    if (mergeAgentFact(st, birth?.agent)) {
+      changed = true
+    }
+    return changed
   }
 
   /**
@@ -894,16 +971,18 @@ export function createTracker(options: TrackerOptions): Tracker {
     eventCreated: number,
     allowCreate: boolean,
     origin?: "session.created",
-    birth?: Pick<SessionSnapshot, "directory">,
+    birth?: Pick<SessionSnapshot, "directory" | "parentID" | "agent">,
   ): Promise<SessionState | undefined> {
     const existing = states.get(sessionID)
     if (existing) {
-      mergeBirthDirectory(existing, birth)
+      // Positive native facts enrich a state created from a failed earlier
+      // lookup; missing values never erase known facts.
+      if (mergeBirthFacts(existing, birth)) {
+        existing.rootDirty = true
+        requestExport(existing)
+      }
       await ensureSourceMetadata(existing)
       return existing
-    }
-    if (excludedSessions.has(sessionID)) {
-      return undefined
     }
     let snapshot: SessionSnapshot | undefined
     try {
@@ -917,21 +996,11 @@ export function createTracker(options: TrackerOptions): Tracker {
     if (closed && !allowCreate) {
       return undefined
     }
-    if (typeof snapshot?.parentID === "string" && snapshot.parentID.length > 0) {
-      excludedSessions.add(sessionID)
-      if (excludedSessions.size > MAX_EXCLUDED_SESSIONS) {
-        const oldest = excludedSessions.values().next().value
-        if (oldest !== undefined) {
-          excludedSessions.delete(oldest)
-        }
-      }
-      return undefined
-    }
     const st = admitSession(sessionID)
     if (!st) {
       return undefined
     }
-    mergeBirthDirectory(st, birth)
+    mergeBirthFacts(st, birth)
     markRootRecovered(st, snapshot, eventCreated)
     if (!st.ledgerSeeded) {
       st.ledgerSeeded = true
@@ -1033,6 +1102,12 @@ export function createTracker(options: TrackerOptions): Tracker {
 
   function handleStepStarted(st: SessionState, data: z.infer<typeof stepStartedSchema>, created: number): void {
     ledgerTurn(st, data.assistantMessageID)
+    // A known child's missing agent name may be filled by its first observed
+    // step agent; an established name is never overwritten (feature-013).
+    if (st.parentID !== undefined && st.agent === undefined && data.agent.length > 0) {
+      st.agent = boundedAgentName(data.agent)
+      st.rootDirty = true
+    }
     const observationId = primaryObservationId(st.sessionID, data.assistantMessageID)
     let entry = st.generations.get(observationId)
     if (!entry) {
@@ -1413,7 +1488,11 @@ export function createTracker(options: TrackerOptions): Tracker {
       if (ledger.tools.has(key)) {
         continue
       }
-      const outcome: ToolScoreOutcome = tool.status === "completed" ? "completed" : tool.status === "error" ? "error" : "pending"
+      // ADR-0004 classification applies to seeds too: a completed native
+      // shell part with a finite non-zero exit is a failure, never a success.
+      const shellExitFailure = tool.name === "shell" && typeof tool.exit === "number" && Number.isFinite(tool.exit) && tool.exit !== 0
+      const outcome: ToolScoreOutcome =
+        tool.status === "error" || shellExitFailure ? "error" : tool.status === "completed" ? "completed" : "pending"
       ledger.tools.set(key, outcome)
       if (outcome === "error") {
         ledger.toolErrorCount += 1
@@ -1812,14 +1891,26 @@ export function createTracker(options: TrackerOptions): Tracker {
 
       const rootNeedsExport = !st.rootExported || st.rootDirty
       if (rootNeedsExport) {
-        // Source metadata (feature-011) rides trace metadata only; the root
-        // observation keeps its existing metadata and child observations are
-        // never touched.
+        // Child traces link to their direct parent (feature-013); source
+        // metadata (feature-011) rides trace metadata only; the root
+        // observation keeps its own metadata without source fields, and child
+        // observations are never touched.
+        const childLabel = st.parentID !== undefined ? subagentLabel(st.agent) : undefined
+        const traceName = childLabel !== undefined ? `${SUBAGENT_TRACE_NAME_PREFIX}${childLabel}` : TRACE_NAME
+        const linkMetadata: Record<string, string> =
+          st.parentID !== undefined
+            ? {
+                role: "subagent",
+                parentSessionID: st.parentID,
+                parent_trace_id: sessionIdentity(st.parentID).traceId,
+                ...(st.agent !== undefined ? { agent: st.agent } : {}),
+              }
+            : {}
         const traceCaptured = applyCapturePolicy(
           {
             input: st.firstPrompt,
             output: st.latestAssistantOutput,
-            metadata: { ...st.sourceMetadata, sessionId: st.sessionID, completed: st.rootEndedAt !== undefined },
+            metadata: { ...linkMetadata, ...st.sourceMetadata, sessionId: st.sessionID, completed: st.rootEndedAt !== undefined },
           },
           policy,
         )
@@ -1827,7 +1918,7 @@ export function createTracker(options: TrackerOptions): Tracker {
           {
             input: st.firstPrompt,
             output: st.latestAssistantOutput,
-            metadata: { sessionId: st.sessionID, completed: st.rootEndedAt !== undefined },
+            metadata: { ...linkMetadata, sessionId: st.sessionID, completed: st.rootEndedAt !== undefined },
           },
           policy,
         )
@@ -1837,11 +1928,13 @@ export function createTracker(options: TrackerOptions): Tracker {
             ? Math.max(st.rootEndedAt, st.observedChildTerminalMax ?? st.rootEndedAt)
             : undefined
         const endIso = toIso(endMs)
-        const langfuseSessionId = truncate(st.sessionID, LANGFUSE_SESSION_ID_MAX)
+        // Children group under the direct parent's Langfuse session id while
+        // keeping their own trace/root identities (feature-013).
+        const langfuseSessionId = truncate(st.parentID ?? st.sessionID, LANGFUSE_SESSION_ID_MAX)
 
         const traceBody: Record<string, unknown> = {
           id: st.identity.traceId,
-          name: TRACE_NAME,
+          name: traceName,
           sessionId: langfuseSessionId,
           metadata: traceCaptured.metadata,
         }
@@ -1859,7 +1952,7 @@ export function createTracker(options: TrackerOptions): Tracker {
         const spanBody: Record<string, unknown> = {
           id: st.identity.rootObservationId,
           traceId: st.identity.traceId,
-          name: TRACE_NAME,
+          name: traceName,
           level: "DEFAULT",
           metadata: captured.metadata,
         }
@@ -1989,6 +2082,10 @@ export function createTracker(options: TrackerOptions): Tracker {
       if (!st || descriptor.admitted) {
         return
       }
+      if (st.parentID !== undefined && st.agent === undefined && descriptor.agent !== undefined) {
+        st.agent = boundedAgentName(descriptor.agent)
+        st.rootDirty = true
+      }
       if (!admitGeneration(st, descriptor.observationId)) {
         return
       }
@@ -2103,28 +2200,31 @@ export function createTracker(options: TrackerOptions): Tracker {
         diagnostic(`event ${type} has no usable sessionID; dropped`)
         return Promise.resolve()
       }
-      // Native session.created carries parentID directly: children never get
-      // state, lookups, or generations.
-      let birth: Pick<SessionSnapshot, "directory"> | undefined
+      // Native birth facts (directory, parentID, agent) are read once at
+      // dispatch; child sessions are admitted like primaries (feature-013).
+      let birth: Pick<SessionSnapshot, "directory" | "parentID" | "agent"> | undefined
       if (type === "session.created" && isRecord(envelope.data.data)) {
-        const parentID = envelope.data.data.parentID
-        if (typeof parentID === "string" && parentID.length > 0) {
-          excludedSessions.add(sessionID)
-          if (excludedSessions.size > MAX_EXCLUDED_SESSIONS) {
-            const oldest = excludedSessions.values().next().value
-            if (oldest !== undefined) {
-              excludedSessions.delete(oldest)
-            }
-          }
-          return Promise.resolve()
-        }
         const dir = birthDirectory(envelope.data.data)
-        birth = dir !== undefined ? { directory: dir } : undefined
+        const rawParent = envelope.data.data.parentID
+        const parentID = typeof rawParent === "string" && rawParent.length > 0 ? rawParent : undefined
+        const rawAgent = envelope.data.data.agent
+        const agent = typeof rawAgent === "string" && rawAgent.length > 0 ? rawAgent : undefined
+        birth = {
+          ...(dir !== undefined ? { directory: dir } : {}),
+          ...(parentID !== undefined ? { parentID } : {}),
+          ...(agent !== undefined ? { agent } : {}),
+        }
       }
       return enqueueState(sessionID, async () => {
         // The event was accepted before this task ran, so its session may still
         // be created even when shutdown began in the meantime.
-        const st = await reconcile(sessionID, created, true, type === "session.created" ? "session.created" : undefined, birth)
+        const st = await reconcile(
+          sessionID,
+          created,
+          true,
+          type === "session.created" ? "session.created" : undefined,
+          birth,
+        )
         if (!st || !rememberDurable(st, durable, envelopeId)) {
           return
         }

@@ -6,7 +6,9 @@
   committed after live verification (per-feature commit policy, operator-approved 2026-11-09);
   feature-003 implemented and live-verified 2026-11-09; feature-004 implemented and
   live-verified 2026-11-09; feature-005 implemented and live-verified 2026-11-10; features
-  006–009 implemented and live-verified 2026-11-10 (this change, uncommitted).
+  006–009 implemented and live-verified 2026-11-10 (uncommitted); features 011–013 implemented
+  and live-verified 2026-11-10 (this change, uncommitted, per the 006–009 precedent). The
+  feature list (`docs/feature-list.json`) is complete: features 001–013 all `passes: true`.
 
 ## Confirmed working surfaces
 
@@ -119,13 +121,69 @@
   submissions. Dynamic emitted strings (tool names, model attribution, lookup/transport/event
   errors) pass the redactor; generation status messages use the fixed capture-status
   explanation while `captureOutputs` is off.
-- Verification harness: scratch project `/tmp/oc-feature005` (mock OpenAI-compatible provider
-  on `127.0.0.1:18125` with a Langfuse ingestion forwarding recorder from
-  `/tmp/oc-feature005/mock-server.mjs`, built plugin under `.opencode/plugins/`, foreground
-  `opencode serve` on `127.0.0.1:14105` + `opencode run --server`, temporary HOME with a 0600
-  plugin config; assertions in `assert-live.mjs`/`assert-submitted.mjs`). The earlier
-  `/tmp/oc-feature003` harness (port 18123) verified feature-004; `/tmp/oc-verify` (port 8123)
-  predates both.
+- **feature-011 (passing, live-verified 2026-11-10, harness `/tmp/oc-features011-013`, stage
+  `source`):** source/git metadata recorded per trace from the session's own location. Real
+  repository case (`/mnt/dev/projects/opencode-langfuse`, plugin via global auto-discovery
+  under a temporary real-home): stored `source_type:"git-repo"`, `git_branch:"master"`
+  matching the independently read native `ctx.vcs.get` current branch, `git_commit` matching
+  independent HEAD, `repo_root_name:"opencode-langfuse"` as the no-origin identity,
+  `metadata_source:"git-detection"`, root/observation payloads free of source fields, five
+  scores and `0.00011925` primaries unchanged. Scratch git case (branch `feature-011-fixture`,
+  credential-bearing synthetic origin): sanitized host/path only, `repo_identity:"demo/opencode-source"`,
+  credentials/scheme/query/fragment/`.git`/canary absent. Root override file (applied from a
+  nested directory on the same server): `repo_identity:"fixture/override"`, owner/name,
+  `service_name`, canary-carrying `environment` redacted, rejected keys (`git_commit`,
+  `sessionId`, `parent_trace_id`, `token`, `unknown_key`) omitted, real branch/HEAD retained,
+  `metadata_source:"repo-file"`, and a later trace upsert (`--session` continuation) keeps the
+  overrides. Metadata-only preset: source metadata present, content fields absent, usage
+  numeric. Non-git location: `non-git` source with no repository-file leak, ordinary tracing
+  unaffected.
+- **feature-012 (passing, live-verified 2026-11-10, same harness, stage `commands`):**
+  `/langfuse-status` and `/langfuse-test` work exactly as specified. Disabled case: both
+  commands accepted via `POST /api/session/<SID>/command` (204), truthful disabled status
+  (state/source/`not configured` host+key/effective preset+flags/redacted reason), test refusal
+  logged, zero ingestion attempts. Configured cases (full-debug, metadata-only,
+  metadata-only+INPUTS=1, env-over-file, reject switch, cleanliness): active `file`/`env`
+  source, redacted host, masked key, resolved preset, all five actual flags, `Last runtime
+  error: none` initially. Each test invocation submits one standalone `opencode-langfuse-test`
+  trace/root — accepted upstream AND stored in real Langfuse with matching ids, no session
+  grouping, no scores, policy-dependent input/output (`{command:"/langfuse-test"}`/`"ok"`),
+  metadata exactly `{source:"opencode-langfuse", command:"langfuse-test"}`, distinct ids per
+  invocation with no collision against session traces. Reject switch: fixed 503 fails the
+  command and records `Last runtime error: [langfuse-test]`; restored pass succeeds and the
+  earlier error remains. Cleanliness: status/test produce no provider HTTP calls, no
+  transcript/session events, and only the test's own ingestion batch; ordinary tracing
+  continues afterward. Live finding recorded in the API reference: `GET /api/command` lists
+  config-defined commands only — plugin transform commands are invocable but unlisted.
+- **feature-013 (passing, live-verified 2026-11-10, same harness, stage `children`):** a
+  parent session whose mock offered `subagent` spawned a real child (`shell` exit 7). Fetched
+  via the parent's Langfuse session id: parent trace `opencode-agent` (sessionId=parent) and
+  child trace `opencode-subagent:general` (sessionId=parent, ids independently derived from
+  the natively observed child session id). Child trace metadata carried `role:"subagent"`,
+  `parentSessionID`/`parent_trace_id` matching the native parent, and `agent:"general"`;
+  parent trace metadata carries source fields, child trace metadata carries the same source
+  fields; roots and all observations stayed under their own trace/root ids. Each trace has
+  exactly two primaries (usage `{input:37,…}`, cost `0.00011925` each) and exactly one tool
+  span: parent `subagent` DEFAULT, child `shell` ERROR with `nativeStatus:"completed"` /
+  `exitCode:7`; the parent did not inherit the shell failure. Stored scores: parent
+  1/2/0/1/0, child 1/2/1/0/1, ids keyed by each session's own id. Full-debug redacted the
+  canary; metadata-only omitted all content keys without losing linkage/usage/cost/scores.
+  Cold restart of only the harness server (same HOME/native store) plus
+  `run --session <child> --agent general "F1113-CHILD-CONTINUE"`: child trace/root/score ids
+  unchanged, original root input preserved, one additional primary (child scores now
+  1/3/1/0/1), parent observations/scores unchanged. The cold-restore seed now applies the
+  ADR-0004 rule to recovered shell exits (regression test added after the live gate caught a
+  completed exit-7 shell seeding as a success).
+- Verification harness: `/tmp/oc-features011-013` (`node harness.mjs
+  <source|commands|children>`): mock OpenAI-compatible provider + Langfuse forwarding recorder
+  (scratch-only reject switch `POST /fixture/ingestion-mode`) on 127.0.0.1:18127, foreground
+  `opencode serve` on 127.0.0.1:14107, per-case temporary homes with 0600 plugin configs
+  forwarding to the approved real Langfuse, built plugin under `.opencode/plugins/`, scalar
+  evidence plugin (birth/parent/agent/directory/VCS/step/tool/execution identity; a cold-load
+  race means `session.created` can predate a plugin's subscription, so the evidence VCS read
+  keys on the first observed event and reads the directory from `session.get`). The earlier
+  harnesses remain: `/tmp/oc-features006-009` (port 18126), `/tmp/oc-feature005` (18125),
+  `/tmp/oc-feature003` (18123), `/tmp/oc-verify` (8123), `/tmp/r1-probe`.
 
 ## Operational findings worth remembering
 
@@ -155,15 +213,17 @@
 
 ## Active work
 
-- None in flight. Features 001–010 plus 006–009 done; remaining features 011 (source/git
-  metadata), 012 (slash commands), 013 (child-session trace grouping) per
-  `docs/feature-list.json`.
+- None in flight. Features 001–013 are implemented and live-verified; the feature list
+  (`docs/feature-list.json`) is complete. Uncommitted on `master`: features 006–009 (prior
+  change) and 011–013 (this change) await the operator's per-feature commits.
 
 ## Blockers and unknowns
 
 - None blocking. Open items: tier discriminator for context-threshold pricing (ADR-0002 note —
   v0 quotes tier zero and flags `firstTierApproximation`); distribution channel (npm vs git)
-  deferred to first release — `dist/` is gitignored meanwhile.
+  deferred to first release — `dist/` is gitignored meanwhile. `GET /api/command` not listing
+  plugin-registered commands is a v2.0.31 native behavior (recorded in the API reference), not
+  a plugin defect.
 
 ## Verification status
 
@@ -177,9 +237,14 @@
 - feature-007: passing (live evidence above, 2026-11-10; lifecycle identity per ADR-0004).
 - feature-008: passing (live evidence above, 2026-11-10; complete-history-only scores per ADR-0004).
 - feature-009: passing (live evidence above, 2026-11-10; preset contract over all capture paths).
-- Features 011–013: failing/unverified (see docs/feature-list.json).
+- feature-011: passing (live evidence above, 2026-11-10; ADR-0005).
+- feature-012: passing (live evidence above, 2026-11-10; ADR-0005).
+- feature-013: passing (live evidence above, 2026-11-10; ADR-0005).
+- Deterministic suite: `npm run typecheck` clean, `npm test` 195/195 green, `npm run build`
+  produces `dist/index.js` (self-contained esbuild node22 bundle).
 
 ## Next useful move
 
-- Select the next feature from `docs/feature-list.json` (011–013) and implement one bounded
-  unit at a time, live-verifying any trace-path change against the real Langfuse.
+- The feature list is complete. Useful follow-ups outside the current contract: per-feature
+  commits for the uncommitted 006–009 and 011–013 work, the deferred distribution channel
+  decision, and the ADR-0002 tier-discriminator note.

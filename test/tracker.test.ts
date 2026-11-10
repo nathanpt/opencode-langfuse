@@ -643,12 +643,12 @@ test("same-kind auxiliary requests pair by Request identity under reverse-order 
   assert.notEqual(ends[0], ends[1], "each retains its own terminal time")
 })
 
-test("unmatched responses return unchanged and excluded children produce no generations", async () => {
+test("unmatched responses return unchanged and child auxiliaries attribute to the child trace", async () => {
   const transport = fakeTransport()
   const logs: LogSpy = { messages: [] }
   const tracker = makeTracker(
     transport,
-    { lookupSession: async (id) => (id === SID ? undefined : { parentID: "ses_parent" }) },
+    { lookupSession: async (id) => (id === SID ? undefined : { parentID: "ses_parent", agent: "general" }) },
     logs,
   )
   const stranger = makeResponse(null)
@@ -670,8 +670,23 @@ test("unmatched responses return unchanged and excluded children produce no gene
     request: new Request("http://mock/child"),
   })
   await tracker.flushAll()
-  assert.equal(transport.batches.length, 0, "children produce no trace or generations")
-  assert.equal(pendingSessionClean(tracker) || tracker.pendingSessionIds().every((id) => id === SID), true)
+  const flat = flatten(transport)
+  const childTrace = flat.find((e) => e.type === "trace-create" && e.body.id === expectedTraceId("ses_child"))
+  assert.ok(childTrace, "children export their own trace")
+  assert.equal(childTrace.body.name, "opencode-subagent:general")
+  assert.equal(childTrace.body.sessionId, "ses_parent", "child groups under the direct parent session")
+  assert.equal(metaOf(childTrace).role, "subagent")
+  assert.equal(metaOf(childTrace).parentSessionID, "ses_parent")
+  assert.equal(metaOf(childTrace).parent_trace_id, expectedTraceId("ses_parent"))
+  const childGen = flat.find((e) => e.type.startsWith("generation-") && e.body.traceId === expectedTraceId("ses_child"))
+  assert.ok(childGen, "child auxiliary generation attributes to the child trace")
+  assert.equal(metaOf(childGen).kind, "title")
+  assert.equal(childGen.body.parentObservationId, expectedRootId("ses_child"))
+  assert.ok(!flat.some((e) => e.body.id === expectedTraceId("ses_parent")), "an unobserved parent creates no fake trace")
+  assert.equal(
+    pendingSessionClean(tracker) || tracker.pendingSessionIds().every((id) => id === SID || id === "ses_child"),
+    true,
+  )
 })
 
 test("metadata-only preset exports no provider text and still redacts metadata strings", async () => {
@@ -1258,4 +1273,233 @@ test("an unpriced primary omits costDetails entirely and warns once per tracker"
   }
   assert.equal(omissionWarnings(logs).filter((m) => m.includes("mock/mock-1")).length, 1)
   assert.equal(omissionWarnings(logs).filter((m) => m.includes("mock/mock-2")).length, 1)
+})
+
+// ---- feature-013: child admission, linkage, and grouping boundaries.
+
+test("a late birth corrects an unclassified cold state under the same deterministic identity", async () => {
+  const transport = fakeTransport()
+  const logs: LogSpy = { messages: [] }
+  const child = "ses_late_child"
+  let lookupWorks = false
+  const tracker = makeTracker(
+    transport,
+    {
+      lookupSession: async (id) => {
+        if (id !== child || !lookupWorks) {
+          throw new Error("native unavailable")
+        }
+        return { parentID: SID, agent: "general" }
+      },
+    },
+    logs,
+  )
+  // Cold facts arrive while the lookup fails: fail open, no invented linkage.
+  tracker.handleEvent(ev("session.inbox.enqueued", BASE + 100, { sessionID: child, item: { type: "user", payload: { text: "child prompt" } } }, 1))
+  tracker.handleEvent(ev("session.execution.succeeded", BASE + 400, { sessionID: child }, 2))
+  await tracker.flushAll()
+  const initial = flatten(transport).find((e) => e.type === "trace-create" && e.body.id === expectedTraceId(child))
+  assert.ok(initial)
+  assert.equal(initial.body.name, "opencode-agent", "unclassified state exports as a plain session")
+  assert.equal(initial.body.sessionId, child)
+  assert.equal(metaOf(initial).parentSessionID, undefined)
+
+  // The birth arrives late: same ids, now child-named and parent-grouped.
+  lookupWorks = true
+  tracker.handleEvent(ev("session.created", BASE, { sessionID: child, parentID: SID, agent: "general" }, 0))
+  await tracker.flushAll()
+  const revisions = flatten(transport).filter((e) => e.type === "trace-create" && e.body.id === expectedTraceId(child))
+  assert.ok(revisions.length >= 2, "the same trace id is upserted")
+  const last = revisions[revisions.length - 1]
+  assert.equal(last.body.name, "opencode-subagent:general")
+  assert.equal(last.body.sessionId, SID)
+  assert.equal(metaOf(last).parentSessionID, SID)
+  assert.equal(metaOf(last).parent_trace_id, expectedTraceId(SID))
+})
+
+test("native birth facts admit a child even when the info lookup fails", async () => {
+  const transport = fakeTransport()
+  const logs: LogSpy = { messages: [] }
+  const child = "ses_birth_child"
+  const tracker = makeTracker(
+    transport,
+    {
+      lookupSession: async () => {
+        throw new Error("lookup down")
+      },
+    },
+    logs,
+  )
+  tracker.handleEvent(ev("session.created", BASE, { sessionID: child, parentID: SID, agent: "general", location: { directory: "/tmp" } }, 0))
+  tracker.handleEvent(ev("session.inbox.enqueued", BASE + 100, { sessionID: child, item: { type: "user", payload: { text: "prompt" } } }, 1))
+  tracker.handleEvent(ev("session.execution.succeeded", BASE + 400, { sessionID: child }, 2))
+  await tracker.flushAll()
+  const flat = flatten(transport)
+  const trace = flat.find((e) => e.type === "trace-create" && e.body.id === expectedTraceId(child))
+  assert.ok(trace)
+  assert.equal(trace.body.name, "opencode-subagent:general")
+  assert.equal(trace.body.sessionId, SID)
+  assert.equal(metaOf(trace).parentSessionID, SID)
+  assert.ok(logs.messages.some((m) => m.includes("failed session lookup")), "lookup failure still diagnosed")
+})
+
+test("identical assistant and tool ids across parent and children stay distinct", async () => {
+  const transport = fakeTransport()
+  const childA = "ses_twin_a"
+  const childB = "ses_twin_b"
+  const tracker = makeTracker(transport, {
+    lookupSession: async (id) => (id === SID ? undefined : { parentID: SID, agent: "general" }),
+  })
+  for (const sid of [SID, childA, childB]) {
+    tracker.handleEvent(ev("session.created", BASE, { sessionID: sid, ...(sid === SID ? {} : { parentID: SID, agent: "general" }) }, 0))
+    tracker.handleEvent(ev("session.step.started", BASE + 200, { sessionID: sid, assistantMessageID: "msg_1", agent: "build", model: { id: "mock-1", providerID: "mock" }, started: BASE + 199 }, 1))
+    tracker.handleEvent(ev("session.tool.input.started", BASE + 205, { sessionID: sid, assistantMessageID: "msg_1", id: "call_1", name: "shell" }, 2))
+    tracker.handleEvent(ev("session.tool.called", BASE + 210, { sessionID: sid, assistantMessageID: "msg_1", id: "call_1", input: { command: "x" }, executed: false }, 3))
+    tracker.handleEvent(ev("session.tool.success", BASE + 260, { sessionID: sid, assistantMessageID: "msg_1", id: "call_1", content: [{ type: "text", text: "ok" }], metadata: {} }, 4))
+    tracker.handleEvent(ev("session.step.ended", BASE + 310, { sessionID: sid, assistantMessageID: "msg_1", finish: "stop", cost: 5, tokens: { input: 37, output: 5, reasoning: 2, cache: { read: 5, write: 0 } } }, 5))
+    tracker.handleEvent(ev("session.execution.succeeded", BASE + 400, { sessionID: sid }, 6))
+  }
+  await tracker.flushAll()
+  const flat = flatten(transport)
+  for (const sid of [SID, childA, childB]) {
+    const traceId = expectedTraceId(sid)
+    const trace = flat.find((e) => e.type === "trace-create" && e.body.id === traceId)
+    assert.ok(trace, `trace exists for ${sid}`)
+    const primary = flat.filter((e) => e.type.startsWith("generation-") && e.body.traceId === traceId && metaOf(e).kind === "primary")
+    assert.equal(primary.length, 1, `exactly one primary for ${sid}`)
+    assert.equal(primary[0].body.id, expectedGenerationId(sid, "msg_1"))
+    const span = flat.find((e) => (e.type === "span-create" || e.type === "span-update") && metaOf(e).kind === "tool" && metaOf(e).sessionId === sid)
+    assert.ok(span, `tool span attributed to ${sid}`)
+    assert.equal(span.body.id, createHash("sha256").update(`opencode-langfuse:tool:${sid}:msg_1:call_1`, "utf8").digest("hex").slice(0, 16))
+    if (sid === SID) {
+      assert.equal(trace.body.name, "opencode-agent")
+    } else {
+      assert.equal(trace.body.name, "opencode-subagent:general")
+      assert.equal(trace.body.sessionId, SID)
+      assert.equal(metaOf(trace).parentSessionID, SID)
+    }
+  }
+})
+
+test("a grandchild links to its direct parent, not a guessed ancestor", async () => {
+  const transport = fakeTransport()
+  const mid = "ses_mid_child"
+  const grand = "ses_grand_child"
+  const tracker = makeTracker(transport, {
+    lookupSession: async (id) => (id === mid ? { parentID: SID, agent: "general" } : id === grand ? { parentID: mid, agent: "general" } : undefined),
+  })
+  tracker.handleEvent(ev("session.created", BASE, { sessionID: grand, parentID: mid, agent: "general" }, 0))
+  tracker.handleEvent(ev("session.execution.succeeded", BASE + 400, { sessionID: grand }, 1))
+  await tracker.flushAll()
+  const trace = flatten(transport).find((e) => e.type === "trace-create" && e.body.id === expectedTraceId(grand))
+  assert.ok(trace)
+  assert.equal(metaOf(trace).parentSessionID, mid, "direct parent, never the interactive ancestor")
+  assert.equal(metaOf(trace).parent_trace_id, expectedTraceId(mid))
+  assert.equal(trace.body.sessionId, mid)
+})
+
+test("an unusable or missing agent name falls back to the safe subagent label", async () => {
+  const transport = fakeTransport()
+  const secret = "ses_agent_secret"
+  const unusable = "ses_agent_unusable"
+  const missing = "ses_agent_missing"
+  const tracker = makeTracker(transport, { lookupSession: async () => undefined })
+  tracker.handleEvent(ev("session.created", BASE, { sessionID: secret, parentID: SID, agent: "sk-ant-feature1113-canary general" }, 0))
+  tracker.handleEvent(ev("session.created", BASE + 1, { sessionID: unusable, parentID: SID, agent: "///" }, 0))
+  tracker.handleEvent(ev("session.created", BASE + 2, { sessionID: missing, parentID: SID }, 0))
+  for (const sid of [secret, unusable, missing]) {
+    tracker.handleEvent(ev("session.execution.succeeded", BASE + 400, { sessionID: sid }, 1))
+  }
+  await tracker.flushAll()
+  const flat = flatten(transport)
+  const secretTrace = flat.find((e) => e.type === "trace-create" && e.body.id === expectedTraceId(secret))
+  assert.ok(secretTrace)
+  assert.ok(!String(secretTrace.body.name).includes("sk-ant-feature1113-canary"))
+  const unusableTrace = flat.find((e) => e.type === "trace-create" && e.body.id === expectedTraceId(unusable))
+  assert.equal(unusableTrace?.body.name, "opencode-subagent:subagent")
+  const missingTrace = flat.find((e) => e.type === "trace-create" && e.body.id === expectedTraceId(missing))
+  assert.equal(missingTrace?.body.name, "opencode-subagent:subagent")
+})
+
+test("duplicate births and warm continuation keep linkage and counts stable", async () => {
+  const transport = fakeTransport()
+  const logs: LogSpy = { messages: [] }
+  const child = "ses_dup_child"
+  const tracker = makeTracker(transport, {}, logs)
+  tracker.handleEvent(ev("session.created", BASE, { sessionID: child, parentID: SID, agent: "general" }, 0))
+  tracker.handleEvent(ev("session.created", BASE + 1, { sessionID: child, parentID: SID, agent: "general" }, 1))
+  tracker.handleEvent(ev("session.step.started", BASE + 200, { sessionID: child, assistantMessageID: "msg_c1", agent: "general", model: { id: "mock-1", providerID: "mock" }, started: BASE + 199 }, 2))
+  tracker.handleEvent(ev("session.step.ended", BASE + 310, { sessionID: child, assistantMessageID: "msg_c1", finish: "stop", cost: 5, tokens: { input: 37, output: 5, reasoning: 2, cache: { read: 5, write: 0 } } }, 3))
+  tracker.handleEvent(ev("session.execution.succeeded", BASE + 400, { sessionID: child }, 4))
+  await tracker.flushAll()
+  let scores = flatten(transport).filter((e) => e.type === "score-create" && e.body.traceId === expectedTraceId(child))
+  assert.equal(scores.length, 5)
+  const turnScore = scores.find((e) => e.body.name === "turn_count")
+  assert.equal(turnScore?.body.value, 1, "duplicate births never duplicate ledger facts")
+
+  // Warm continuation: another turn, same trace, linkage intact.
+  tracker.handleEvent(ev("session.created", BASE + 500, { sessionID: child, parentID: SID, agent: "general" }, 5))
+  tracker.handleEvent(ev("session.step.started", BASE + 600, { sessionID: child, assistantMessageID: "msg_c2", agent: "general", model: { id: "mock-1", providerID: "mock" }, started: BASE + 599 }, 6))
+  tracker.handleEvent(ev("session.step.ended", BASE + 610, { sessionID: child, assistantMessageID: "msg_c2", finish: "stop", cost: 5, tokens: { input: 9, output: 2, reasoning: 0, cache: { read: 0, write: 0 } } }, 7))
+  tracker.handleEvent(ev("session.execution.succeeded", BASE + 620, { sessionID: child }, 8))
+  await tracker.flushAll()
+  const revisions = flatten(transport).filter((e) => e.type === "trace-create" && e.body.id === expectedTraceId(child))
+  const last = revisions[revisions.length - 1]
+  assert.equal(last.body.name, "opencode-subagent:general")
+  assert.equal(metaOf(last).parentSessionID, SID)
+  assert.equal(metaOf(last).parent_trace_id, expectedTraceId(SID))
+  scores = flatten(transport).filter((e) => e.type === "score-create" && e.body.traceId === expectedTraceId(child))
+  const turns = scores.filter((e) => e.body.name === "turn_count")
+  assert.equal(turns.length, 2, "ordered updates, not duplicated facts")
+  assert.equal(turns[1].body.value, 2)
+})
+
+test("children count toward the tracked-session capacity", async () => {
+  const transport = fakeTransport()
+  const logs: LogSpy = { messages: [] }
+  const tracker = makeTracker(transport, {}, logs)
+  const pending: Promise<void>[] = []
+  for (let i = 0; i < 256; i += 1) {
+    pending.push(
+      tracker.handleEvent(ev("session.created", BASE + i, { sessionID: `ses_child_${i}`, parentID: "ses_root", agent: "general" }, 0)),
+    )
+  }
+  pending.push(tracker.handleEvent(ev("session.created", BASE + 999, { sessionID: "ses_child_over", parentID: "ses_root", agent: "general" }, 0)))
+  await Promise.all(pending)
+  const ids = tracker.pendingSessionIds()
+  assert.ok(!ids.includes("ses_child_over"))
+  assert.equal(logs.messages.filter((m) => m.includes("tracked session capacity")).length, 1)
+})
+
+test("held ingestion keeps submitted batches unchanged while the ordered next batch retains child metadata", async () => {
+  const batches: IngestEvent[][] = []
+  const gated: (() => void)[] = []
+  const transport: LangfuseTransport = {
+    async ingest(events) {
+      batches.push(events)
+      await new Promise<void>((resolve) => gated.push(resolve))
+      return { accepted: events.length, failed: 0 }
+    },
+  }
+  const logs: LogSpy = { messages: [] }
+  const child = "ses_held_child"
+  const tracker = makeTracker(transport as never, {}, logs)
+  tracker.handleEvent(ev("session.inbox.enqueued", BASE + 100, { sessionID: SID, item: { type: "user", payload: { text: "parent prompt" } } }, 1))
+  const parentFlush = tracker.flushNow(SID)
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  tracker.handleEvent(ev("session.created", BASE, { sessionID: child, parentID: SID, agent: "general" }, 0))
+  tracker.handleEvent(ev("session.execution.succeeded", BASE + 400, { sessionID: child }, 1))
+  const childFlush = tracker.flushNow(child)
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  assert.equal(batches.length, 2, "parent batch is on the wire, child batch is held behind it")
+  assert.ok(!JSON.stringify(batches[0]).includes("ses_held_child"), "the submitted parent batch is unchanged by child facts")
+
+  gated[0]()
+  gated[1]()
+  await Promise.all([parentFlush, childFlush])
+  const childBatch = batches[1].flat()
+  const childTrace = childBatch.find((e) => e.type === "trace-create" && e.body.id === expectedTraceId(child))
+  assert.ok(childTrace)
+  assert.equal(childTrace.body.name, "opencode-subagent:general")
+  assert.equal(metaOf(childTrace).parentSessionID, SID)
 })
