@@ -32,6 +32,15 @@ export const MAX_TRACKED_SESSIONS = 256
 /** Maximum admitted, not-yet-settled/exported generations per session; overflow refuses telemetry. */
 export const MAX_PENDING_GENERATIONS_PER_SESSION = 256
 
+/** Maximum admitted, not-yet-settled/exported tool observations per session; overflow refuses telemetry. */
+export const MAX_PENDING_TOOLS_PER_SESSION = 256
+
+/** Maximum retained compaction lifecycles per session; overflow refuses telemetry. */
+export const MAX_PENDING_COMPACTIONS_PER_SESSION = 256
+
+/** Maximum combined score-fact identities per session; overflow suppresses score updates. */
+export const MAX_SCORE_FACTS_PER_SESSION = 8192
+
 /**
  * Deterministic identity seeds. Trace and root observation ids are derived from the
  * OpenCode session id alone, so a continued or reconstructed session reuses them. No
@@ -40,5 +49,8 @@ export const MAX_PENDING_GENERATIONS_PER_SESSION = 256
 export const TRACE_SEED_PREFIX = "opencode-langfuse:trace:"
 export const ROOT_SEED_PREFIX = "opencode-langfuse:root:"
 export const GENERATION_SEED_PREFIX = "opencode-langfuse:generation:"
+export const TOOL_SEED_PREFIX = "opencode-langfuse:tool:"
+export const COMPACTION_SEED_PREFIX = "opencode-langfuse:compaction:"
+export const SCORE_SEED_PREFIX = "opencode-langfuse:score:"
 
 export const DEFAULT_LANGFUSE_HOST = "https://cloud.langfuse.com"

@@ -7,6 +7,42 @@ All notable changes to this project are documented in this file. Format based on
 
 ### Added
 
+- Tool observations (feature-006): one root-parented span per exact tool call, paired by the
+  full `(sessionID, assistantMessageID, toolCallID)` identity with deterministic ids. Failure
+  classification follows the operator-selected rule — the `execute.after` error status or a
+  finite non-zero structured native shell `exit` — never output text; the actual native status
+  and validated exit code are exported (`metadata.nativeStatus`/`exitCode`), and interruption is
+  a WARNING, not an invented error. Tool input/output use the existing `toolInput`/`toolOutput`
+  privacy slots (captured once, detached, before retention); status text is fixed whenever tool
+  I/O capture is off. Capacity refusal (256 pending per session) warns once per episode and
+  never blocks provider delivery.
+- Compaction spans (feature-007): one content-free span per native compaction lifecycle with
+  deterministic identity from the native start sequence (`kind:"compaction"`, reason, boundaries
+  only — no input/output/usage/cost, no summary bytes in any preset). A terminal observed
+  without its start exports terminal-only with no fabricated start time; a new start while a
+  lifecycle is open marks the older one interrupted (`next-compaction.started`); natively
+  interrupted compactions are WARNING. One lifecycle stays one span no matter how many HTTP
+  generations it drives.
+- Trace scores (feature-008): the five cumulative scores (`tool_call_count`, `turn_count`,
+  `total_tool_errors`, `tool_success_rate`, `session_had_errors`) publish on native execution
+  terminals with stable body ids (`sha256(opencode-langfuse:score:<sessionID>:<name>)`). Counts
+  advance once per primary-turn and per tool identity from a bounded in-memory ledger; a warm
+  tracker stays cumulative across compactions, continued prompts, flushes, and pruning. Scores
+  publish only when complete history is provable and every admitted tool has an authoritative
+  terminal — pending/interrupted tools delay the snapshot rather than fabricating a success
+  ratio, and after a compacted cold restore (or ledger overflow) all five updates are omitted
+  with one bounded warning instead of overwriting stored totals.
+- Privacy completion (feature-009): the preset contract now governs every capture path from its
+  first implementation. Tool payloads are gated before retention, metadata is whitelisted per
+  observation type (never a spread of native events/results/errors), and dynamic emitted
+  strings — tool names, model attribution, allowed error messages, lookup/transport/event-stream
+  diagnostics — pass the redactor. Generation status messages use the fixed capture-status
+  explanation while output capture is off, so provider/output content cannot echo through the
+  status-message path; numeric usage/cost and scores remain available under metadata-only.
+- Decision record ADR-0004 (tool observation, compaction span, and score lifecycle): the
+  exit-code classification rule, stable span/score identities, complete-history-only score
+  updates, and the root-sibling observation hierarchy extending ADR-0003.
+
 - Self-computed generation cost (feature-005): primaries carry `costDetails` computed once from
   the request's normalized usage and an independently resolved price — never the host's `cost`,
   which is recorded only as diagnostic `metadata.hostCost`. Price resolution per ADR-0002 in

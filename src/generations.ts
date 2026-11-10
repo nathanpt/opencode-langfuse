@@ -163,7 +163,12 @@ export function buildGenerationEvent(
 
   const captured = applyCapturePolicy({ metadata }, policy)
 
-  const statusMessage = record.statusMessage ?? STATUS_EXPLANATION[record.captureStatus]
+  // Dynamic status text can echo provider/output content: while output
+  // capture is off, the fixed per-status explanation is exported instead of
+  // the raw message (feature-009). With capture on, the bounded message is
+  // redacted like every other emitted string.
+  const fixedExplanation = STATUS_EXPLANATION[record.captureStatus]
+  const statusMessage = policy.captureOutputs ? (record.statusMessage ?? fixedExplanation) : fixedExplanation
 
   const body: Record<string, unknown> = {
     id: record.observationId,
@@ -184,9 +189,10 @@ export function buildGenerationEvent(
     body.endTime = endTime
   }
   // Exactly the host's model reference id (e.g. "mock-1") — never a display name,
-  // session default, or another request's model.
+  // session default, or another request's model. Dynamic emitted string: passes
+  // the redactor like every other exported attribute.
   if (record.model?.id !== undefined) {
-    body.model = record.model.id
+    body.model = redactString(record.model.id)
   }
   // Normalized token usage as reported by OpenCode's durable step events; never
   // derived from provider payloads or guessed for requests without step events.

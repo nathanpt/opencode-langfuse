@@ -296,6 +296,34 @@ test("primary endTime is the stream boundary even when tool settlement lags", as
   assert.equal(metaOf(gen).finishReason, "tool-calls")
 })
 
+test("provider error status text is the fixed explanation while output capture is off", async () => {
+  const transport = fakeTransport()
+  const tracker = createTracker({
+    transport,
+    policy: createCapturePolicy({ preset: "metadata-only", env: FULL_ENV }),
+    pricing: testPricing(),
+    flushDelayMs: 5,
+    newId: () => "id-fixed",
+    now: () => BASE + 10_000,
+    log: () => {},
+  })
+  tracker.handleEvent(inboxPrompt("p"))
+  tracker.handleEvent(stepStarted("msg_g", { seq: 2 }))
+  tracker.handleEvent(stepFailed("msg_g", "provider said SECRET_TOKEN=supersecretvalue", BASE + 700, 3))
+  tracker.handleEvent(executionSucceeded(BASE + 800, 4))
+  await tracker.flushAll()
+
+  const gen = generationsOf(flatten(transport))[0]
+  assert.equal(gen.body.level, "ERROR", "classification is unchanged by the gating")
+  assert.equal(gen.body.statusMessage, "provider stream failed")
+  const wire = JSON.stringify(gen)
+  assert.ok(!wire.includes("provider said"), "raw provider message never exported")
+  assert.ok(!wire.includes("supersecretvalue"))
+  // Numeric usage stays available under metadata-only.
+  const usage = gen.body.usageDetails as Record<string, number>
+  assert.equal(usage.input, 4)
+})
+
 test("step.failed keeps ERROR, computes partial cost independently, and records host cost as metadata only", async () => {
   const transport = fakeTransport()
   const logs: string[] = []

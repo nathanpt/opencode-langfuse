@@ -5,14 +5,17 @@ import { loadConfig, maskPublicKey } from "./config.js"
 import { createLangfuseTransport } from "./langfuse.js"
 import { createPricingResolver } from "./pricing.js"
 import { redactValue } from "./redaction.js"
-import { createTracker, type AssistantSnapshot, type SessionSnapshot } from "./tracker.js"
+import { createTracker, type AssistantSnapshot, type SessionSnapshot, type ToolSnapshot } from "./tracker.js"
 import type { ModelReference } from "./generations.js"
 import { isRecord } from "./guards.js"
+import { nativeExit, toolOutputText } from "./tools.js"
+import type { ScoreSeedTool } from "./scores.js"
 
 const SUBSCRIBED_EVENT_TYPES = [
   "session.created",
   "session.inbox.enqueued",
   "session.text.ended",
+  "session.execution.started",
   "session.execution.succeeded",
   "session.execution.failed",
   "session.execution.interrupted",
@@ -20,6 +23,13 @@ const SUBSCRIBED_EVENT_TYPES = [
   "session.step.streamed",
   "session.step.ended",
   "session.step.failed",
+  "session.tool.input.started",
+  "session.tool.called",
+  "session.tool.success",
+  "session.tool.failed",
+  "session.compaction.started",
+  "session.compaction.ended",
+  "session.compaction.failed",
 ] as const
 
 function boundedText(value: unknown): string | undefined {
@@ -81,6 +91,61 @@ function parseSessionSnapshot(info: unknown, context: unknown): SessionSnapshot 
     snapshot.createdAt = time.created
   }
   const messages = Array.isArray(context) ? context : []
+  // Score history seeding: identities and terminal outcomes only. A completed
+  // compaction boundary means the window lost its prefix — incomplete, never
+  // invented. Streaming-only tool parts are not admitted calls and are skipped.
+  let completedCompaction = false
+  let malformed = false
+  const turns: string[] = []
+  const tools: ScoreSeedTool[] = []
+  for (const message of messages) {
+    if (!isRecord(message)) {
+      malformed = true
+      continue
+    }
+    if (message.type === "compaction") {
+      if (message.status === "completed") {
+        completedCompaction = true
+      }
+      continue
+    }
+    if (message.type === "assistant" && typeof message.id === "string" && message.id.length > 0) {
+      turns.push(message.id)
+      const content = Array.isArray(message.content) ? message.content : []
+      for (const part of content) {
+        if (!isRecord(part) || part.type !== "tool") {
+          continue
+        }
+        if (typeof part.id !== "string" || part.id.length === 0 || typeof part.name !== "string" || part.name.length === 0) {
+          malformed = true
+          continue
+        }
+        const state = isRecord(part.state) ? part.state : undefined
+        const status = state?.status
+        if (status === "streaming") {
+          continue
+        }
+        if (status !== "running" && status !== "completed" && status !== "error") {
+          malformed = true
+          continue
+        }
+        const tool: {
+          assistantMessageID: string
+          toolCallID: string
+          name: string
+          status: "running" | "completed" | "error"
+          exit?: number
+        } = { assistantMessageID: message.id, toolCallID: part.id, name: part.name, status }
+        const exit = nativeExit(isRecord(state?.metadata) ? state.metadata.exit : undefined)
+        if (exit !== undefined) {
+          tool.exit = exit
+        }
+        tools.push(tool)
+      }
+    }
+  }
+  snapshot.scoreHistory =
+    completedCompaction || malformed ? { complete: false } : { complete: true, turns, tools }
   for (const message of messages) {
     if (!isRecord(message)) {
       continue
@@ -128,6 +193,56 @@ function parseAssistantSnapshot(message: unknown, assistantMessageID: string): A
     snapshot.errorMessage = boundedText(error.message)
   }
   return snapshot
+}
+
+/**
+ * The exact matching assistant tool part only (feature-006): never borrows
+ * another call's identity. Maps finite `time.ran ?? time.created` /
+ * `time.completed` and `state.metadata.exit`; output follows the same
+ * textual-content rule as live capture.
+ */
+function parseToolSnapshot(message: unknown, assistantMessageID: string, toolCallID: string): ToolSnapshot | undefined {
+  if (!isRecord(message) || message.id !== assistantMessageID || message.type !== "assistant" || !Array.isArray(message.content)) {
+    return undefined
+  }
+  for (const part of message.content) {
+    if (!isRecord(part) || part.type !== "tool" || part.id !== toolCallID) {
+      continue
+    }
+    if (typeof part.name !== "string" || part.name.length === 0) {
+      return undefined
+    }
+    const time = isRecord(part.time) ? part.time : undefined
+    const ranAt = typeof time?.ran === "number" && Number.isFinite(time.ran) ? time.ran : undefined
+    const createdAt = typeof time?.created === "number" && Number.isFinite(time.created) ? time.created : undefined
+    const completedAt = typeof time?.completed === "number" && Number.isFinite(time.completed) ? time.completed : undefined
+    const state = isRecord(part.state) ? part.state : undefined
+    const stateStatus = state?.status
+    const snapshot: ToolSnapshot = {
+      name: part.name,
+      status: stateStatus === "completed" || stateStatus === "error" ? stateStatus : "running",
+      startedAt: ranAt ?? createdAt,
+    }
+    if (completedAt !== undefined) {
+      snapshot.completedAt = completedAt
+    }
+    if (state?.input !== undefined) {
+      snapshot.input = state.input
+    }
+    const output = toolOutputText(state?.content)
+    if (output !== undefined) {
+      snapshot.output = output
+    }
+    const exit = nativeExit(isRecord(state?.metadata) ? state.metadata.exit : undefined)
+    if (exit !== undefined) {
+      snapshot.exit = exit
+    }
+    if (isRecord(state?.error) && typeof state.error.message === "string" && state.error.message.length > 0) {
+      snapshot.errorMessage = boundedText(state.error.message)
+    }
+    return snapshot
+  }
+  return undefined
 }
 
 export default Plugin.define({
@@ -178,8 +293,28 @@ export default Plugin.define({
         }
         return undefined
       },
+      lookupTool: async (sessionID, assistantMessageID, toolCallID) => {
+        const context: unknown = await ctx.session.context({ sessionID })
+        if (!Array.isArray(context)) {
+          return undefined
+        }
+        for (const message of context) {
+          const snapshot = parseToolSnapshot(message, assistantMessageID, toolCallID)
+          if (snapshot) {
+            return snapshot
+          }
+        }
+        return undefined
+      },
     })
     const controller = new AbortController()
+
+    // Read-only tool outcome hook (feature-006): awaited registration, before
+    // the event subscription. handleToolAfter captures synchronously and never
+    // awaits session work, so provider delivery is never delayed here.
+    await ctx.tool.hook("execute.after", (event) => {
+      tracker.handleToolAfter(event)
+    })
 
     // Awaited native HTTP hooks (registration returns a promise). Primary
     // exchanges are acquired from durable step identity, never from traffic.
@@ -233,7 +368,9 @@ export default Plugin.define({
         }
       } catch (error) {
         if (!controller.signal.aborted) {
-          console.warn(`📊 Langfuse: Event stream failed: ${String(error)}`)
+          // The stream is a boundary: dynamic error text passes the redactor
+          // like every other emitted string, never raw.
+          console.warn(`📊 Langfuse: Event stream failed: ${String(redactValue(truncateDiagnostic(error)))}`)
         }
       }
     })()

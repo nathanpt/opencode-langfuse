@@ -5,7 +5,8 @@
 - Branch `master`. Foundation committed (030160b); features 001, 002, 010 implemented and
   committed after live verification (per-feature commit policy, operator-approved 2026-11-09);
   feature-003 implemented and live-verified 2026-11-09; feature-004 implemented and
-  live-verified 2026-11-09; feature-005 implemented and live-verified 2026-11-10 (this change).
+  live-verified 2026-11-09; feature-005 implemented and live-verified 2026-11-10; features
+  006–009 implemented and live-verified 2026-11-10 (this change, uncommitted).
 
 ## Confirmed working surfaces
 
@@ -65,8 +66,59 @@
   per plugin lifetime (cached failure; late settlement inert). Metadata-only restart: fresh
   priced session keeps numeric usage/cost (`0.00011925`, `pricingSource: config`) while trace/
   root/generation content stays absent and the CLI answer is normal.
-- `npm run typecheck` (clean) and `npm test` (88/88) green; `npm run build` produces
+- `npm run typecheck` (clean) and `npm test` (148/148) green; `npm run build` produces
   `dist/index.js` (~1.8 MB, self-contained).
+- **feature-006 (passing, live-verified 2026-11-10, harness `/tmp/oc-features006-009`, stage
+  `tools`):** one root-parented span per exact tool call, named for the redacted native tool
+  name, paired by the full `(sessionID, assistantMessageID, toolCallID)` identity with
+  deterministic ids (ADR-0004). Classification follows the operator-selected rule: the
+  `execute.after` error status **or** a finite non-zero structured native shell exit
+  (`metadata.exit`) means ERROR with `metadata.nativeStatus`/`exitCode` preserved — the
+  preflight proved v2.0.31 reports `status:"completed"` + `exit:7` and the span exported
+  `nativeStatus:"completed"`, `exitCode:7`, `level:ERROR`. Successful output containing the
+  word "error" stays DEFAULT. The unavailable-`bash` native error path exports one ERROR span
+  through the durable `session.tool.failed` fallback (`outcomeSource:"session.tool.failed"`)
+  even though no after-hook fires for it. Duplicate/reversed/late facts keep one observation
+  per identity; held POSTs submit unchanged snapshots then ordered updates; unnameable calls
+  are omitted with one bounded diagnostic; capacity refusal (256) warns once per episode and
+  resets; interrupted calls are WARNING, never invented errors; shutdown marks running calls
+  `plugin.shutdown`. Two primaries + title intact, each primary cost `0.00011925`; stored
+  Langfuse state matched submissions (3 stored shell spans, ERROR/DEFAULT levels).
+- **feature-007 (passing, live-verified 2026-11-10, same harness, stage `compaction`):** one
+  content-free `kind:"compaction"` span per native compaction lifecycle (ADR-0004). Native
+  finding: a second immediate `compact` on a freshly-compacted session fails fast with
+  `compaction.unavailable` — the plugin exported that lifecycle honestly as ERROR; two
+  successful manual compactions (fresh content between them) produced two distinct spans, each
+  matched to its own native `started`/`ended` envelope times, DEFAULT/manual, root-parented,
+  with exactly two deliberately induced provider exchanges under the first lifecycle (the
+  mock's invalid-then-nudged retry) and no span carrying input/output/usage/cost or any summary
+  bytes. Invalid-mode compaction exported an ERROR span with fixed status text `compaction
+  failed` while its HTTP-200 auxiliary generations kept honest consumer-side classification;
+  stored spans matched submissions.
+- **feature-008 (passing, live-verified 2026-11-10, same harness, stage `scores`):** the five
+  cumulative trace scores publish on native execution terminals only when complete history is
+  provable and every admitted tool has an authoritative terminal (ADR-0004). Live values
+  matched native facts exactly: 3/2/1/⅔/1 after a three-tool prompt, 6/4/2/⅔/1 after the
+  `--session` continuation with the same five stable score body ids, 0/1/0/1/0 for a plain
+  prompt, 1/2/1/0/1 for unavailable-`bash`; warm compaction between prompts did not reset
+  totals; a compacted cold restore suppressed all five updates with exactly one
+  `Scores omitted … complete history unavailable` warning while observations kept flowing; an
+  uncompacted restart restored exact counts without double-counting. `dataType` NUMERIC /
+  BOOLEAN (`session_had_errors`), trace linkage, and score ids
+  `sha256(opencode-langfuse:score:<sessionID>:<name>)[:32]` verified on submissions and stored
+  state.
+- **feature-009 (passing, live-verified 2026-11-10, same harness, stage `privacy`):** the
+  existing preset contract completed over every new capture path. All four presets exercised
+  through emitted payloads (canary `sk-ant-feature069-canary` in prompt, assistant text,
+  permitted tool text, nested tool input, and an error message): metadata-only absent content
+  fields (keys absent, not null/empty), full-debug redacted canaries (`[REDACTED_SECRET]`),
+  `metadata-only` + INPUTS=1/OUTPUTS=0/TOOL_IO=1 and `full-debug` + all-off overrides honored,
+  file preset overridden by `LANGFUSE_PRIVACY_PRESET`, numeric usage/cost and complete-history
+  scores preserved in every preset, authoritative failure classification and named spans intact,
+  fixed failure/status texts under content-off presets, and stored state agreeing with
+  submissions. Dynamic emitted strings (tool names, model attribution, lookup/transport/event
+  errors) pass the redactor; generation status messages use the fixed capture-status
+  explanation while `captureOutputs` is off.
 - Verification harness: scratch project `/tmp/oc-feature005` (mock OpenAI-compatible provider
   on `127.0.0.1:18125` with a Langfuse ingestion forwarding recorder from
   `/tmp/oc-feature005/mock-server.mjs`, built plugin under `.opencode/plugins/`, foreground
@@ -103,7 +155,9 @@
 
 ## Active work
 
-- None in flight. feature-005 done; remaining features 006–013 per `docs/feature-list.json`.
+- None in flight. Features 001–010 plus 006–009 done; remaining features 011 (source/git
+  metadata), 012 (slash commands), 013 (child-session trace grouping) per
+  `docs/feature-list.json`.
 
 ## Blockers and unknowns
 
@@ -119,9 +173,13 @@
 - feature-003: passing (live evidence above, 2026-11-09; ADR-0003).
 - feature-004: passing (live evidence above, 2026-11-09; capture point per ADR-0002/R1).
 - feature-005: passing (live evidence above, 2026-11-10; pricing layers per ADR-0002).
-- Features 006–013: failing/unverified (see docs/feature-list.json).
+- feature-006: passing (live evidence above, 2026-11-10; classification rule per ADR-0004).
+- feature-007: passing (live evidence above, 2026-11-10; lifecycle identity per ADR-0004).
+- feature-008: passing (live evidence above, 2026-11-10; complete-history-only scores per ADR-0004).
+- feature-009: passing (live evidence above, 2026-11-10; preset contract over all capture paths).
+- Features 011–013: failing/unverified (see docs/feature-list.json).
 
 ## Next useful move
 
-- Select the next feature from `docs/feature-list.json` (006–013) and implement one bounded
+- Select the next feature from `docs/feature-list.json` (011–013) and implement one bounded
   unit at a time, live-verifying any trace-path change against the real Langfuse.

@@ -2,7 +2,7 @@
 
 Status: implementation phase. Facts are verified against the OpenCode v2 plugin docs (fetched
 2026-11-09, against installed opencode v2.0.31) and a read of the sibling `omp-langfuse` v0.4.0
-source. Features 001/002/003/004/005/010 are implemented and live-verified (see PROGRESS.md);
+source. Features 001–010 are implemented and live-verified (see PROGRESS.md);
 remaining features and items marked **UNKNOWN** are open work; see docs/feature-list.json.
 
 ## What this system is
@@ -68,8 +68,13 @@ tagged auxiliary generations acquired from `http.request`/`http.response` via ex
 on primary generations from the R1 capture point, and self-computed `costDetails` per ADR-0002
 (feature-005: usage × one resolved price from config override → catalog first tier → bundled
 table; omitted with a once-per-model warning when unresolvable; host `cost` kept only as
-diagnostic `metadata.hostCost`). Still to come: compaction spans (007), scores (009), child
-traces (013).
+diagnostic `metadata.hostCost`). Root-sibling observations and scores per ADR-0004: tool spans
+(006 — operator-selected exit-code classification, exact-identity pairing, one observation per
+call), compaction spans (007 — one content-free span per native lifecycle, deterministic
+identity from the start sequence), and the five cumulative trace scores (008 — published only
+when complete history is provable and every admitted tool has an authoritative terminal;
+omitted with a bounded warning after a compacted cold restore). Still to come: child
+traces (013), source metadata (011), slash commands (012).
 
 ## Design decisions (all five resolved 2026-11-09)
 

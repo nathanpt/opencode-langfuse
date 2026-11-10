@@ -79,11 +79,11 @@
       "category": "functional",
       "description": "Tool calls become observations with error level on failure",
       "steps": [
-        "Run a session with successful tool calls and one intentional failure (non-zero bash exit)",
+        "Run a session with successful tool calls, one intentional non-zero shell exit, and one natively errored tool call",
         "Verify each tool call produces an observation named for the tool",
-        "Verify the failing call has level=ERROR / isError=true derived from execute.after status, not from payload content"
+        "Verify the failing call has level=ERROR / isError=true derived from the execute.after error status or a finite non-zero structured native shell exit (metadata.exit), even when the native hook status is completed \u2014 never from output text"
       ],
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "dependencies": [
         "feature-002"
@@ -97,7 +97,7 @@
         "Drive a session long enough to compact (or otherwise trigger a compaction request)",
         "Verify the trace records a compaction span tagged with kind=compaction"
       ],
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "dependencies": [
         "feature-002"
@@ -111,7 +111,7 @@
         "Run a multi-tool session with one intentional failure and fetch the newest trace",
         "Verify all five scores: tool_call_count, turn_count, total_tool_errors, tool_success_rate, session_had_errors \u2014 and that their values match the observed run"
       ],
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "dependencies": [
         "feature-006"
@@ -126,7 +126,7 @@
         "Set preset full-debug, seed a session with a fake API key in tool output, and verify the key is redacted in the captured payload",
         "Verify per-field env overrides (LANGFUSE_CAPTURE_*) still take precedence over the preset"
       ],
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "dependencies": [
         "feature-002"

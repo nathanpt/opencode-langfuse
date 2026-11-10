@@ -9,6 +9,7 @@
 
 import { INGEST_TIMEOUT_MS } from "./constants.js"
 import { isRecord } from "./guards.js"
+import { redactValue } from "./redaction.js"
 
 export interface LangfuseEndpointConfig {
   host: string
@@ -107,7 +108,7 @@ export function createLangfuseTransport(config: LangfuseEndpointConfig, options:
           }
         }
       }
-      log(`Failed to ingest ${events.length} event(s) to ${config.host}: ${String(lastError)}`)
+      log(`Failed to ingest ${events.length} event(s) to ${config.host}: ${String(redactValue(String(lastError)))}`)
       return { accepted: 0, failed: events.length }
     },
   }

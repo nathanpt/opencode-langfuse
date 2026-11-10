@@ -19,7 +19,10 @@ import {
   FLUSH_GRACE_MS,
   GENERATION_SEED_PREFIX,
   LANGFUSE_SESSION_ID_MAX,
+  MAX_PENDING_COMPACTIONS_PER_SESSION,
   MAX_PENDING_GENERATIONS_PER_SESSION,
+  MAX_PENDING_TOOLS_PER_SESSION,
+  MAX_SCORE_FACTS_PER_SESSION,
   MAX_STRING_LENGTH,
   MAX_TRACKED_SESSIONS,
   ROOT_SEED_PREFIX,
@@ -38,6 +41,33 @@ import type { IngestEvent, LangfuseTransport } from "./langfuse.js"
 import { isRecord } from "./guards.js"
 import type { PricingResolver } from "./pricing.js"
 import { redactValue } from "./redaction.js"
+import {
+  buildToolEvent,
+  captureHookToolInput,
+  captureHookToolOutput,
+  isToolFailure,
+  nativeExit,
+  toolObservationId,
+  toolOutputText,
+  type ToolEndBoundary,
+  type ToolRecord,
+} from "./tools.js"
+import {
+  buildCompactionEvent,
+  compactionStartId,
+  compactionTerminalId,
+  type CompactionEndBoundary,
+  type CompactionRecord,
+} from "./compactions.js"
+import {
+  buildScoreEvent,
+  computeScores,
+  SCORE_NAMES,
+  scoreId,
+  type ScoreCounts,
+  type ScoreHistorySnapshot,
+  type ScoreName,
+} from "./scores.js"
 
 const finiteNumber = z.number().finite()
 
@@ -141,11 +171,90 @@ const executionInterruptedSchema = z.object({
   reason: z.string().optional(),
 })
 
+const executionStartedSchema = z.object({
+  sessionID: z.string().min(1),
+})
+
+const toolKeyDataSchema = z.object({
+  sessionID: z.string().min(1),
+  assistantMessageID: z.string().min(1),
+  id: z.string().min(1),
+})
+
+const toolInputStartedSchema = toolKeyDataSchema.and(
+  z.object({
+    name: z.string().min(1),
+  }),
+)
+
+const toolCalledSchema = toolKeyDataSchema.and(
+  z.object({
+    input: z.unknown().optional(),
+    // `executed` is not a success flag (observed successful calls carry false); parsed and ignored.
+    executed: z.boolean().optional(),
+  }),
+)
+
+const toolTerminalMetadataSchema = z.record(z.string(), z.unknown()).optional()
+
+const toolSuccessSchema = toolKeyDataSchema.and(
+  z.object({
+    content: z.unknown().optional(),
+    metadata: toolTerminalMetadataSchema,
+  }),
+)
+
+const toolFailedSchema = toolKeyDataSchema.and(
+  z.object({
+    error: z.object({ type: z.string().optional(), message: z.string().optional() }).loose(),
+    metadata: toolTerminalMetadataSchema,
+  }),
+)
+
+/** Awaited `ctx.tool.hook("execute.after")` receipt, parsed defensively at the boundary. */
+const toolAfterSchema = z.object({
+  tool: z.string().min(1),
+  sessionID: z.string().min(1),
+  messageID: z.string().min(1),
+  id: z.string().min(1),
+  input: z.unknown().optional(),
+  status: z.enum(["completed", "error"]),
+  result: z.unknown().optional(),
+  error: z
+    .object({ message: z.string().optional() })
+    .loose()
+    .optional(),
+})
+
+// Compaction lifecycle: only sessionID, reason, optional inputID, and the
+// structured error type are read. Native error message/summary/text/recent/
+// providerContext/native/usage/cost fields are deliberately ignored — no
+// compaction content is ever captured.
+const compactionStartedSchema = z.object({
+  sessionID: z.string().min(1),
+  reason: z.enum(["auto", "manual"]),
+  inputID: z.string().optional(),
+})
+
+const compactionEndedSchema = z.object({
+  sessionID: z.string().min(1),
+  reason: z.enum(["auto", "manual"]),
+})
+
+const compactionFailedSchema = z.object({
+  sessionID: z.string().min(1),
+  reason: z.enum(["auto", "manual"]),
+  error: z.object({ type: z.string().optional(), message: z.string().optional() }).loose(),
+  inputID: z.string().optional(),
+})
+
 export interface SessionSnapshot {
   parentID?: string
   createdAt?: number
   firstPrompt?: string
   latestAssistantOutput?: string
+  /** Recovered score-fact identities from the same transcript read (feature-008). */
+  scoreHistory?: ScoreHistorySnapshot
 }
 
 export interface AssistantSnapshot {
@@ -157,6 +266,18 @@ export interface AssistantSnapshot {
   completedAt?: number
   finish?: string
   errorMessage?: string
+}
+
+/** One exact tool-call part recovered from the transcript (feature-006 lookupTool). */
+export interface ToolSnapshot {
+  name: string
+  input?: unknown
+  output?: unknown
+  status: "running" | "completed" | "error"
+  exit?: number
+  errorMessage?: string
+  startedAt?: number
+  completedAt?: number
 }
 
 export interface TrackerOptions {
@@ -173,6 +294,8 @@ export interface TrackerOptions {
   lookupSession?(sessionID: string): Promise<SessionSnapshot | undefined>
   /** Targeted recovery of one missing primary start from the transcript. */
   lookupAssistant?(sessionID: string, assistantMessageID: string): Promise<AssistantSnapshot | undefined>
+  /** Targeted recovery of one missing tool name/start from the exact transcript tool part. */
+  lookupTool?(sessionID: string, assistantMessageID: string, toolCallID: string): Promise<ToolSnapshot | undefined>
 }
 
 export interface AuxiliaryRequestInfo {
@@ -199,6 +322,12 @@ export interface Tracker {
   startAuxiliary(info: AuxiliaryRequestInfo): void
   /** Pairs a response with its request's descriptor and wraps the body. */
   observeAuxiliaryResponse(info: AuxiliaryResponseInfo): Response
+  /**
+   * Validates and captures one read-only `execute.after` receipt; enqueues
+   * per-session work. Never throws into the tool pipeline, mutates the
+   * payload, or awaits session reconciliation/ingestion.
+   */
+  handleToolAfter(event: unknown): void
   flushNow(sessionID: string): Promise<void>
   flushAll(): Promise<void>
   pendingSessionIds(): string[]
@@ -214,6 +343,30 @@ interface GenEntry {
   recoveredStreamedAt?: number
 }
 
+interface ToolEntry {
+  record: ToolRecord
+  dirty: boolean
+  createExported: boolean
+  /** A called/after/terminal fact admitted this identity as an executed call. */
+  admitted: boolean
+  /** An execute.after hook receipt was merged into this entry. */
+  hookSeen: boolean
+  /** A terminal outcome (hook or durable fact) was recorded. */
+  terminalSeen: boolean
+  /** Name-hint/transcript recovery for a missing name or start was attempted. */
+  lookedUp: boolean
+  /** endTime came from the hook's tagged fallback; a durable terminal may replace it. */
+  endFromHookFallback: boolean
+}
+
+interface CompactionEntry {
+  record: CompactionRecord
+  dirty: boolean
+  createExported: boolean
+  /** A native terminal fact (or plugin-side interruption) closed this lifecycle. */
+  closed: boolean
+}
+
 interface SessionState {
   sessionID: string
   identity: SessionIdentity
@@ -223,16 +376,46 @@ interface SessionState {
   rootDirty: boolean
   rootExported: boolean
   rootEndedAt?: number
-  auxTerminalMax?: number
+  observedChildTerminalMax?: number
   generations: Map<string, GenEntry>
   refusedGenerations: Set<string>
   capacityWarned: boolean
+  tools: Map<string, ToolEntry>
+  /** Name hints from session.tool.input.started, keyed by `${assistantMessageID}\u0000${toolCallID}`. */
+  toolNames: Map<string, string>
+  refusedTools: Set<string>
+  toolCapacityWarned: boolean
+  compactions: Map<string, CompactionEntry>
+  /** The one lifecycle currently open (native single-compaction guarantee). */
+  activeCompaction?: { observationId: string; startedSeq: number; reason: "auto" | "manual" }
+  refusedCompactions: Set<string>
+  compactionCapacityWarned: boolean
+  /** Score-fact ledger: identity sets + incremental counts, seeded at first reconciliation only. */
+  ledger?: ScoreLedger
+  ledgerSeeded: boolean
+  scoreOmissionWarned: boolean
+  executionActive: boolean
+  executionTerminalSeen: boolean
+  scoresDirty: boolean
+  publishedScores?: ScoreCounts
   exportTimer?: ReturnType<typeof setTimeout>
   exportDeadline?: number
   exporting: boolean
   lastActiveAt: number
   seenDurableSeqs: Set<number>
   seenEventIds: Set<string>
+}
+
+type ToolScoreOutcome = "pending" | "completed" | "error"
+
+interface ScoreLedger {
+  /** True when the complete history is provable; false never becomes true later. */
+  complete: boolean
+  turns: Set<string>
+  tools: Map<string, ToolScoreOutcome>
+  toolErrorCount: number
+  /** Exact deduplication was lost; score updates are suppressed from here on. */
+  overflow: boolean
 }
 
 interface AuxDescriptor {
@@ -252,6 +435,7 @@ const SELECTED_EVENT_TYPES: Record<string, true> = {
   "session.created": true,
   "session.inbox.enqueued": true,
   "session.text.ended": true,
+  "session.execution.started": true,
   "session.execution.succeeded": true,
   "session.execution.failed": true,
   "session.execution.interrupted": true,
@@ -259,6 +443,13 @@ const SELECTED_EVENT_TYPES: Record<string, true> = {
   "session.step.streamed": true,
   "session.step.ended": true,
   "session.step.failed": true,
+  "session.tool.input.started": true,
+  "session.tool.called": true,
+  "session.tool.success": true,
+  "session.tool.failed": true,
+  "session.compaction.started": true,
+  "session.compaction.ended": true,
+  "session.compaction.failed": true,
 }
 
 const MAX_SEEN_SEQS = 8192
@@ -308,6 +499,7 @@ export function createTracker(options: TrackerOptions): Tracker {
   const log = options.log ?? ((message: string) => console.warn(`📊 Langfuse: ${message}`))
   const lookupSession = options.lookupSession
   const lookupAssistant = options.lookupAssistant
+  const lookupTool = options.lookupTool
 
   const states = new Map<string, SessionState>()
   const stateChains = new Map<string, Promise<void>>()
@@ -349,12 +541,37 @@ export function createTracker(options: TrackerOptions): Tracker {
     return count
   }
 
+  /** Admitted, unsettled/unexported tool calls: exactly what the per-session cap protects. */
+  function pendingToolCount(st: SessionState): number {
+    let count = 0
+    for (const entry of st.tools.values()) {
+      if (entry.admitted && (entry.dirty || entry.record.captureStatus === "running")) {
+        count += 1
+      }
+    }
+    return count
+  }
+
+  /** Retained, not-yet-exported compaction lifecycles. */
+  function pendingCompactionCount(st: SessionState): number {
+    let count = 0
+    for (const entry of st.compactions.values()) {
+      if (entry.dirty) {
+        count += 1
+      }
+    }
+    return count
+  }
+
   function isCleanInactive(st: SessionState): boolean {
     return (
       !st.rootDirty &&
+      !st.scoresDirty &&
       !st.exporting &&
       (pendingWorkBySession.get(st.sessionID) ?? 0) === 0 &&
-      pendingGenerationCount(st) === 0
+      pendingGenerationCount(st) === 0 &&
+      pendingToolCount(st) === 0 &&
+      pendingCompactionCount(st) === 0
     )
   }
 
@@ -409,6 +626,18 @@ export function createTracker(options: TrackerOptions): Tracker {
       generations: new Map(),
       refusedGenerations: new Set(),
       capacityWarned: false,
+      tools: new Map(),
+      toolNames: new Map(),
+      refusedTools: new Set(),
+      toolCapacityWarned: false,
+      compactions: new Map(),
+      refusedCompactions: new Set(),
+      compactionCapacityWarned: false,
+      ledgerSeeded: false,
+      scoreOmissionWarned: false,
+      executionActive: false,
+      executionTerminalSeen: false,
+      scoresDirty: false,
       exporting: false,
       lastActiveAt: now(),
       seenDurableSeqs: new Set(),
@@ -434,11 +663,49 @@ export function createTracker(options: TrackerOptions): Tracker {
     return true
   }
 
+  function admitTool(st: SessionState, observationId: string): boolean {
+    if (st.refusedTools.has(observationId)) {
+      return false
+    }
+    if (pendingToolCount(st) >= MAX_PENDING_TOOLS_PER_SESSION) {
+      if (!st.toolCapacityWarned) {
+        st.toolCapacityWarned = true
+        log(`Tool telemetry refused for session ${st.sessionID}: pending tool capacity reached`)
+      }
+      st.refusedTools.add(observationId)
+      return false
+    }
+    return true
+  }
+
+  function admitCompaction(st: SessionState, observationId: string): boolean {
+    if (st.refusedCompactions.has(observationId)) {
+      return false
+    }
+    if (pendingCompactionCount(st) >= MAX_PENDING_COMPACTIONS_PER_SESSION) {
+      if (!st.compactionCapacityWarned) {
+        st.compactionCapacityWarned = true
+        log(`Compaction telemetry refused for session ${st.sessionID}: pending compaction capacity reached`)
+      }
+      st.refusedCompactions.add(observationId)
+      return false
+    }
+    return true
+  }
+
   /** Resets a refusal episode once capacity is available again. */
   function resetCapacityEpisode(st: SessionState): void {
     if (pendingGenerationCount(st) < MAX_PENDING_GENERATIONS_PER_SESSION) {
       st.capacityWarned = false
       st.refusedGenerations.clear()
+    }
+    if (pendingToolCount(st) < MAX_PENDING_TOOLS_PER_SESSION) {
+      st.toolCapacityWarned = false
+      st.refusedTools.clear()
+    }
+    if (pendingCompactionCount(st) < MAX_PENDING_COMPACTIONS_PER_SESSION) {
+      st.compactionCapacityWarned = false
+      st.refusedCompactions.clear()
     }
   }
 
@@ -455,6 +722,40 @@ export function createTracker(options: TrackerOptions): Tracker {
         break
       }
       st.generations.delete(id)
+      overflow -= 1
+    }
+  }
+
+  function pruneSettledTools(st: SessionState): void {
+    if (st.tools.size <= MAX_PENDING_TOOLS_PER_SESSION) {
+      return
+    }
+    const removable = [...st.tools.entries()]
+      .filter(([, entry]) => !entry.dirty && entry.record.captureStatus !== "running")
+      .sort((a, b) => (a[1].record.startTime ?? 0) - (b[1].record.startTime ?? 0))
+    let overflow = st.tools.size - MAX_PENDING_TOOLS_PER_SESSION
+    for (const [id] of removable) {
+      if (overflow <= 0) {
+        break
+      }
+      st.tools.delete(id)
+      overflow -= 1
+    }
+  }
+
+  function pruneSettledCompactions(st: SessionState): void {
+    if (st.compactions.size <= MAX_PENDING_COMPACTIONS_PER_SESSION) {
+      return
+    }
+    const removable = [...st.compactions.entries()]
+      .filter(([, entry]) => !entry.dirty && entry.closed)
+      .sort((a, b) => (a[1].record.startTime ?? 0) - (b[1].record.startTime ?? 0))
+    let overflow = st.compactions.size - MAX_PENDING_COMPACTIONS_PER_SESSION
+    for (const [id] of removable) {
+      if (overflow <= 0) {
+        break
+      }
+      st.compactions.delete(id)
       overflow -= 1
     }
   }
@@ -515,7 +816,12 @@ export function createTracker(options: TrackerOptions): Tracker {
   }
 
   /** Cold-load reconciliation; runs inside the per-session state chain. */
-  async function reconcile(sessionID: string, eventCreated: number, allowCreate: boolean): Promise<SessionState | undefined> {
+  async function reconcile(
+    sessionID: string,
+    eventCreated: number,
+    allowCreate: boolean,
+    origin?: "session.created",
+  ): Promise<SessionState | undefined> {
     const existing = states.get(sessionID)
     if (existing) {
       return existing
@@ -527,7 +833,7 @@ export function createTracker(options: TrackerOptions): Tracker {
     try {
       snapshot = await lookupSession?.(sessionID)
     } catch (error) {
-      log(`Failed to look up session ${sessionID} (treating as primary): ${truncate(String(error), DIAGNOSTIC_LIMIT)}`)
+      diagnostic(`failed session lookup for ${sessionID} (treating as primary): ${String(error)}`)
       snapshot = undefined
     }
     // A lookup completing after shutdown must not recreate records or restart
@@ -550,6 +856,17 @@ export function createTracker(options: TrackerOptions): Tracker {
       return undefined
     }
     markRootRecovered(st, snapshot, eventCreated)
+    if (!st.ledgerSeeded) {
+      st.ledgerSeeded = true
+      // A locally observed session birth starts complete at zero; a cold load
+      // seeds from the snapshot (incomplete after a compacted prefix or a
+      // failed lookup). The first reconciliation is the only seed.
+      if (origin === "session.created") {
+        st.ledger = emptyLedger(true)
+      } else {
+        seedScoreLedger(st, snapshot)
+      }
+    }
     return st
   }
 
@@ -594,7 +911,7 @@ export function createTracker(options: TrackerOptions): Tracker {
     try {
       snapshot = await lookupAssistant?.(st.sessionID, assistantMessageID)
     } catch (error) {
-      log(`Failed to look up assistant ${assistantMessageID}: ${truncate(String(error), DIAGNOSTIC_LIMIT)}`)
+      diagnostic(`failed assistant lookup for ${assistantMessageID}: ${String(error)}`)
     }
     if (!admitGeneration(st, observationId)) {
       return undefined
@@ -637,6 +954,7 @@ export function createTracker(options: TrackerOptions): Tracker {
   }
 
   function handleStepStarted(st: SessionState, data: z.infer<typeof stepStartedSchema>, created: number): void {
+    ledgerTurn(st, data.assistantMessageID)
     const observationId = primaryObservationId(st.sessionID, data.assistantMessageID)
     let entry = st.generations.get(observationId)
     if (!entry) {
@@ -766,11 +1084,627 @@ export function createTracker(options: TrackerOptions): Tracker {
     requestExport(st)
   }
 
+  /** The latest native execution terminal wins, so a continued session's root covers its latest final response. */
   function markExecutionTerminal(st: SessionState, created: number): void {
-    if (st.rootEndedAt === undefined) {
-      st.rootEndedAt = created
-    }
+    st.rootEndedAt = created
+    st.executionActive = false
+    // Succeeded/failed/interrupted native terminals all make scores eligible.
+    st.executionTerminalSeen = true
     st.rootDirty = true
+    evaluateScores(st)
+  }
+
+  /** Bounded, redacted native error/message text retained on a record. */
+  function boundedNativeMessage(value: unknown): string | undefined {
+    if (typeof value !== "string" || value.length === 0) {
+      return undefined
+    }
+    return truncate(String(redactValue(value)), DIAGNOSTIC_LIMIT)
+  }
+
+  function gateToolInput(value: unknown): unknown {
+    return value === undefined ? undefined : captureHookToolInput(value, policy)
+  }
+
+  function gateToolOutput(value: unknown): unknown {
+    return value === undefined ? undefined : applyCapturePolicy({ toolOutput: value }, policy).toolOutput
+  }
+
+  function newToolEntry(sessionID: string, assistantMessageID: string, toolCallID: string, observationId: string): ToolEntry {
+    return {
+      record: { observationId, sessionID, assistantMessageID, toolCallID, captureStatus: "running" },
+      dirty: false,
+      createExported: false,
+      admitted: false,
+      hookSeen: false,
+      terminalSeen: false,
+      lookedUp: false,
+      endFromHookFallback: false,
+    }
+  }
+
+  async function lookupToolSnapshot(
+    st: SessionState,
+    assistantMessageID: string,
+    toolCallID: string,
+  ): Promise<ToolSnapshot | undefined> {
+    try {
+      return await lookupTool?.(st.sessionID, assistantMessageID, toolCallID)
+    } catch (error) {
+      diagnostic(`failed tool lookup for ${toolCallID}: ${String(error)}`)
+      return undefined
+    }
+  }
+
+  /** Merges a recovered transcript snapshot into the entry; never borrows another call's identity. */
+  function applyToolSnapshot(entry: ToolEntry, snapshot: ToolSnapshot | undefined): void {
+    if (!snapshot) {
+      return
+    }
+    const record = entry.record
+    if (record.name === undefined && snapshot.name.length > 0) {
+      record.name = snapshot.name
+    }
+    if (record.startTime === undefined && isFiniteMs(snapshot.startedAt)) {
+      record.startTime = snapshot.startedAt
+      record.startBoundary = "transcript.tool.time"
+    }
+    if (record.input === undefined && snapshot.input !== undefined) {
+      record.input = gateToolInput(snapshot.input)
+    }
+    if (record.output === undefined && snapshot.output !== undefined) {
+      record.output = gateToolOutput(snapshot.output)
+    }
+    if (record.exitCode === undefined && snapshot.exit !== undefined) {
+      record.exitCode = snapshot.exit
+    }
+    if (record.statusMessage === undefined && snapshot.errorMessage !== undefined) {
+      record.statusMessage = snapshot.errorMessage
+    }
+  }
+
+  /** Resolves a missing name/start once: name hint first, then the exact transcript tool part. */
+  async function resolveToolIdentity(
+    st: SessionState,
+    entry: ToolEntry,
+    assistantMessageID: string,
+    toolCallID: string,
+  ): Promise<void> {
+    if (entry.lookedUp) {
+      return
+    }
+    if (entry.record.name === undefined) {
+      entry.record.name = st.toolNames.get(`${assistantMessageID}\u0000${toolCallID}`)
+    }
+    if (entry.record.name !== undefined && entry.record.startTime !== undefined) {
+      return
+    }
+    entry.lookedUp = true
+    const snapshot = await lookupToolSnapshot(st, assistantMessageID, toolCallID)
+    applyToolSnapshot(entry, snapshot)
+  }
+
+  function settleToolOutcome(record: ToolRecord): void {
+    record.captureStatus = isToolFailure(record) ? "error" : "completed"
+  }
+
+  /** A late observed child terminal extends the root endTime without rewriting root content. */
+  function extendRootForChildTerminal(st: SessionState, at: number): void {
+    if (st.rootEndedAt !== undefined && at > st.rootEndedAt) {
+      st.observedChildTerminalMax = Math.max(st.observedChildTerminalMax ?? at, at)
+      st.rootDirty = true
+    }
+  }
+
+  function interruptRunningTools(st: SessionState, endBoundary: ToolEndBoundary): void {
+    for (const [id, entry] of st.tools) {
+      if (entry.record.captureStatus !== "running") {
+        continue
+      }
+      if (entry.record.name === undefined) {
+        // Unnameable records are never exportable; drop with the omission diagnostic.
+        st.tools.delete(id)
+        st.refusedTools.delete(id)
+        diagnostic(
+          `tool observation omitted for ${entry.record.assistantMessageID}/${entry.record.toolCallID} in session ${st.sessionID}: name unavailable`,
+        )
+        continue
+      }
+      entry.record.captureStatus = "interrupted"
+      entry.record.endBoundary = endBoundary
+      entry.dirty = true
+    }
+  }
+
+  function interruptRunningCompactions(st: SessionState, endBoundary: CompactionEndBoundary): void {
+    for (const entry of st.compactions.values()) {
+      if (entry.record.captureStatus === "running") {
+        entry.record.captureStatus = "interrupted"
+        entry.record.endBoundary = endBoundary
+        entry.closed = true
+        entry.dirty = true
+      }
+    }
+    st.activeCompaction = undefined
+  }
+
+  function newCompactionEntry(record: CompactionRecord): CompactionEntry {
+    return { record, dirty: true, createExported: false, closed: false }
+  }
+
+  // ---- score ledger (feature-008): identity sets + incremental counts.
+
+  function emptyLedger(complete: boolean): ScoreLedger {
+    return { complete, turns: new Set(), tools: new Map(), toolErrorCount: 0, overflow: false }
+  }
+
+  function suppressScores(st: SessionState): void {
+    if (st.ledger && !st.ledger.overflow) {
+      st.ledger.overflow = true
+    }
+    if (!st.scoreOmissionWarned) {
+      st.scoreOmissionWarned = true
+      log(`Scores omitted for session "${st.sessionID}": complete history unavailable`)
+    }
+  }
+
+  function ledgerFactCount(ledger: ScoreLedger): number {
+    return ledger.turns.size + ledger.tools.size
+  }
+
+  /** Counts a primary turn once per assistant identity, whatever event delivered it. */
+  function ledgerTurn(st: SessionState, assistantMessageID: string): void {
+    const ledger = st.ledger
+    if (!ledger || ledger.overflow || ledger.turns.has(assistantMessageID)) {
+      return
+    }
+    if (ledgerFactCount(ledger) >= MAX_SCORE_FACTS_PER_SESSION) {
+      suppressScores(st)
+      return
+    }
+    ledger.turns.add(assistantMessageID)
+  }
+
+  /** Admits a tool fact once per (assistant, call) identity; outcomes start pending. */
+  function ledgerToolAdmit(st: SessionState, assistantMessageID: string, toolCallID: string): void {
+    const ledger = st.ledger
+    if (!ledger || ledger.overflow) {
+      return
+    }
+    const key = `${assistantMessageID}\u0000${toolCallID}`
+    if (ledger.tools.has(key)) {
+      return
+    }
+    if (ledgerFactCount(ledger) >= MAX_SCORE_FACTS_PER_SESSION) {
+      suppressScores(st)
+      return
+    }
+    ledger.tools.set(key, "pending")
+  }
+
+  /** Terminal outcome: first authoritative failure adds the error exactly once. */
+  function ledgerToolOutcome(st: SessionState, assistantMessageID: string, toolCallID: string, outcome: "completed" | "error"): void {
+    const ledger = st.ledger
+    if (!ledger || ledger.overflow) {
+      return
+    }
+    const key = `${assistantMessageID}\u0000${toolCallID}`
+    const current = ledger.tools.get(key)
+    if (current === undefined) {
+      ledger.tools.set(key, outcome)
+      if (outcome === "error") {
+        ledger.toolErrorCount += 1
+      }
+      return
+    }
+    if (current === outcome) {
+      return
+    }
+    if (outcome === "error") {
+      ledger.tools.set(key, "error")
+      ledger.toolErrorCount += 1
+    } else if (current === "pending") {
+      ledger.tools.set(key, "completed")
+    }
+    // completed-after-error keeps the authoritative failure already counted.
+  }
+
+  /** Observation-settled outcome sync: the record classification is the single source of truth. */
+  function syncLedgerToolOutcome(st: SessionState, record: ToolRecord): void {
+    if (record.captureStatus === "error") {
+      ledgerToolOutcome(st, record.assistantMessageID, record.toolCallID, "error")
+    } else if (record.captureStatus === "completed") {
+      ledgerToolOutcome(st, record.assistantMessageID, record.toolCallID, "completed")
+    }
+    // running/interrupted observations leave the fact pending: no fabricated success.
+  }
+
+  /** First-reconciliation seeding; a warm ledger is never replaced by a later read. */
+  function seedScoreLedger(st: SessionState, snapshot: SessionSnapshot | undefined): void {
+    const history = snapshot?.scoreHistory
+    if (!history || !history.complete) {
+      st.ledger = emptyLedger(false)
+      return
+    }
+    const ledger = emptyLedger(true)
+    for (const turn of history.turns) {
+      ledger.turns.add(turn)
+    }
+    for (const tool of history.tools) {
+      const key = `${tool.assistantMessageID}\u0000${tool.toolCallID}`
+      if (ledger.tools.has(key)) {
+        continue
+      }
+      const outcome: ToolScoreOutcome = tool.status === "completed" ? "completed" : tool.status === "error" ? "error" : "pending"
+      ledger.tools.set(key, outcome)
+      if (outcome === "error") {
+        ledger.toolErrorCount += 1
+      }
+    }
+    if (ledgerFactCount(ledger) > MAX_SCORE_FACTS_PER_SESSION) {
+      ledger.overflow = true
+    }
+    st.ledger = ledger
+  }
+
+  /**
+   * Publication readiness: complete history, no overflow, an observed native
+   * execution terminal, and no pending tool facts. Ready revisions turn dirty
+   * only when the counts changed; incomplete sessions omit all five updates
+   * with one bounded warning.
+   */
+  function evaluateScores(st: SessionState): void {
+    const ledger = st.ledger
+    if (!ledger || ledger.overflow || !ledger.complete) {
+      if (st.executionTerminalSeen) {
+        suppressScores(st)
+      }
+      return
+    }
+    if (!st.executionTerminalSeen) {
+      return
+    }
+    for (const outcome of ledger.tools.values()) {
+      if (outcome === "pending") {
+        return
+      }
+    }
+    const counts: ScoreCounts = {
+      toolCallCount: ledger.tools.size,
+      turnCount: ledger.turns.size,
+      toolErrorCount: ledger.toolErrorCount,
+    }
+    const published = st.publishedScores
+    if (
+      !published ||
+      published.toolCallCount !== counts.toolCallCount ||
+      published.turnCount !== counts.turnCount ||
+      published.toolErrorCount !== counts.toolErrorCount
+    ) {
+      st.scoresDirty = true
+      requestExport(st)
+    }
+  }
+
+  function scoreRevisionOf(st: SessionState): ScoreCounts | undefined {
+    const ledger = st.ledger
+    if (!ledger || ledger.overflow || !ledger.complete) {
+      return undefined
+    }
+    return {
+      toolCallCount: ledger.tools.size,
+      turnCount: ledger.turns.size,
+      toolErrorCount: ledger.toolErrorCount,
+    }
+  }
+
+  function handleCompactionStarted(
+    st: SessionState,
+    data: z.infer<typeof compactionStartedSchema>,
+    created: number,
+    seq: number,
+  ): void {
+    // A new start while an older lifecycle is still open: the older one is
+    // interrupted (never completed) with an honest boundary.
+    const active = st.activeCompaction
+    if (active) {
+      const previous = st.compactions.get(active.observationId)
+      if (previous && !previous.closed) {
+        previous.record.captureStatus = "interrupted"
+        previous.record.endBoundary = "next-compaction.started"
+        previous.record.endTime = created
+        previous.closed = true
+        previous.dirty = true
+        requestExport(st)
+      }
+      st.activeCompaction = undefined
+    }
+    const observationId = compactionStartId(st.sessionID, seq)
+    if (!st.compactions.has(observationId)) {
+      if (!admitCompaction(st, observationId)) {
+        // Refused telemetry keeps the active pointer consistent for later terminals.
+        st.activeCompaction = { observationId, startedSeq: seq, reason: data.reason }
+        return
+      }
+      const record: CompactionRecord = {
+        observationId,
+        sessionID: st.sessionID,
+        reason: data.reason,
+        startTime: created,
+        captureStatus: "running",
+        startBoundary: "session.compaction.started",
+      }
+      if (data.inputID !== undefined) {
+        record.inputID = data.inputID
+      }
+      st.compactions.set(observationId, newCompactionEntry(record))
+      requestExport(st)
+    }
+    st.activeCompaction = { observationId, startedSeq: seq, reason: data.reason }
+  }
+
+  function handleCompactionEnded(
+    st: SessionState,
+    data: z.infer<typeof compactionEndedSchema>,
+    created: number,
+    seq: number,
+  ): void {
+    const active = st.activeCompaction
+    if (active && active.reason === data.reason) {
+      const entry = st.compactions.get(active.observationId)
+      if (entry && !entry.closed) {
+        // The durable ended fact's `created` is the authoritative end time.
+        entry.record.endTime = created
+        entry.record.endBoundary = "session.compaction.ended"
+        entry.record.captureStatus = "completed"
+        entry.closed = true
+        entry.dirty = true
+        requestExport(st)
+        extendRootForChildTerminal(st, created)
+      }
+      st.activeCompaction = undefined
+      return
+    }
+    // No matching active start: terminal-only span, never a guessed start.
+    if (!admitCompaction(st, compactionTerminalId(st.sessionID, seq))) {
+      return
+    }
+    const record: CompactionRecord = {
+      observationId: compactionTerminalId(st.sessionID, seq),
+      sessionID: st.sessionID,
+      reason: data.reason,
+      endTime: created,
+      captureStatus: "completed",
+      startBoundary: "unavailable",
+      endBoundary: "session.compaction.ended",
+    }
+    st.compactions.set(record.observationId, newCompactionEntry(record))
+    diagnostic(`compaction ended without a matching active start in session ${st.sessionID}; exported terminal-only span`)
+    requestExport(st)
+    extendRootForChildTerminal(st, created)
+  }
+
+  function handleCompactionFailed(
+    st: SessionState,
+    data: z.infer<typeof compactionFailedSchema>,
+    created: number,
+    seq: number,
+  ): void {
+    const interrupted = data.error.type === "compaction.interrupted"
+    const terminalStatus = interrupted ? ("interrupted" as const) : ("error" as const)
+    const active = st.activeCompaction
+    if (active && active.reason === data.reason) {
+      const entry = st.compactions.get(active.observationId)
+      if (entry && !entry.closed) {
+        entry.record.endTime = created
+        entry.record.endBoundary = "session.compaction.failed"
+        entry.record.captureStatus = terminalStatus
+        // inputID consistency: both facts present and disagreeing keeps the start's value.
+        if (data.inputID !== undefined && entry.record.inputID !== undefined && entry.record.inputID !== data.inputID) {
+          diagnostic(
+            `compaction failed inputID ${data.inputID} differs from started ${entry.record.inputID} in session ${st.sessionID}; keeping the started value`,
+          )
+        } else if (entry.record.inputID === undefined && data.inputID !== undefined) {
+          entry.record.inputID = data.inputID
+        }
+        entry.closed = true
+        entry.dirty = true
+        requestExport(st)
+        extendRootForChildTerminal(st, created)
+      }
+      st.activeCompaction = undefined
+      return
+    }
+    if (!admitCompaction(st, compactionTerminalId(st.sessionID, seq))) {
+      return
+    }
+    const record: CompactionRecord = {
+      observationId: compactionTerminalId(st.sessionID, seq),
+      sessionID: st.sessionID,
+      reason: data.reason,
+      endTime: created,
+      captureStatus: terminalStatus,
+      startBoundary: "unavailable",
+      endBoundary: "session.compaction.failed",
+    }
+    if (data.inputID !== undefined) {
+      record.inputID = data.inputID
+    }
+    st.compactions.set(record.observationId, newCompactionEntry(record))
+    diagnostic(`compaction failed without a matching active start in session ${st.sessionID}; exported terminal-only span`)
+    requestExport(st)
+    extendRootForChildTerminal(st, created)
+  }
+
+  async function handleToolCalled(
+    st: SessionState,
+    data: z.infer<typeof toolCalledSchema>,
+    created: number,
+  ): Promise<void> {
+    const observationId = toolObservationId(st.sessionID, data.assistantMessageID, data.id)
+    let entry = st.tools.get(observationId)
+    if (!entry) {
+      if (!admitTool(st, observationId)) {
+        return
+      }
+      entry = newToolEntry(st.sessionID, data.assistantMessageID, data.id, observationId)
+      st.tools.set(observationId, entry)
+      ledgerToolAdmit(st, data.assistantMessageID, data.id)
+    }
+    if (!entry.admitted) {
+      // `called` admits the executed call and supplies the start time.
+      entry.admitted = true
+      entry.record.startTime = created
+      entry.record.startBoundary = "session.tool.called"
+    }
+    // The hook's final input wins; a late duplicate called event never downgrades it.
+    if (!entry.hookSeen) {
+      const gated = gateToolInput(data.input)
+      if (gated !== undefined) {
+        entry.record.input = gated
+      }
+    }
+    await resolveToolIdentity(st, entry, data.assistantMessageID, data.id)
+    entry.dirty = true
+    requestExport(st)
+  }
+
+  async function handleToolTerminal(
+    st: SessionState,
+    kind: "success" | "failed",
+    data: z.infer<typeof toolSuccessSchema> | z.infer<typeof toolFailedSchema>,
+    created: number,
+  ): Promise<void> {
+    const observationId = toolObservationId(st.sessionID, data.assistantMessageID, data.id)
+    let entry = st.tools.get(observationId)
+    if (!entry) {
+      if (!admitTool(st, observationId)) {
+        return
+      }
+      // Terminal without called: one admitted call, no fabricated start time.
+      entry = newToolEntry(st.sessionID, data.assistantMessageID, data.id, observationId)
+      entry.admitted = true
+      entry.record.startBoundary = "unavailable"
+      st.tools.set(observationId, entry)
+    }
+    // The scalar score fact keeps its terminal outcome even when the span is
+    // omitted below — the durable fact is authoritative either way.
+    ledgerToolAdmit(st, data.assistantMessageID, data.id)
+    ledgerToolOutcome(st, data.assistantMessageID, data.id, kind === "success" ? "completed" : "error")
+    evaluateScores(st)
+    await resolveToolIdentity(st, entry, data.assistantMessageID, data.id)
+    if (entry.record.name === undefined) {
+      // Unnameable: omit the span with one bounded diagnostic; scalar score facts are kept above.
+      st.tools.delete(observationId)
+      st.refusedTools.delete(observationId)
+      diagnostic(
+        `tool observation omitted for ${data.assistantMessageID}/${data.id} in session ${st.sessionID}: name unavailable`,
+      )
+      return
+    }
+    const record = entry.record
+    const exit = nativeExit(data.metadata?.exit)
+    if (kind === "success") {
+      if ("content" in data && record.output === undefined) {
+        record.output = gateToolOutput(toolOutputText(data.content))
+      }
+      if (record.nativeStatus === undefined) {
+        record.nativeStatus = "completed"
+        record.outcomeSource = "session.tool.success"
+      }
+    } else {
+      if ("error" in data && record.statusMessage === undefined) {
+        record.statusMessage = boundedNativeMessage(data.error.message)
+      }
+      if (record.nativeStatus === undefined) {
+        record.nativeStatus = "error"
+        record.outcomeSource = "session.tool.failed"
+      }
+    }
+    if (exit !== undefined && record.exitCode === undefined) {
+      record.exitCode = exit
+    }
+    // The durable terminal's `created` is the preferred endTime over the hook fallback.
+    if (!entry.terminalSeen || entry.endFromHookFallback) {
+      record.endTime = created
+      record.endBoundary = kind === "success" ? "session.tool.success" : "session.tool.failed"
+      entry.endFromHookFallback = false
+    }
+    entry.terminalSeen = true
+    settleToolOutcome(record)
+    syncLedgerToolOutcome(st, record)
+    evaluateScores(st)
+    entry.dirty = true
+    requestExport(st)
+    extendRootForChildTerminal(st, created)
+  }
+
+  /** State-task merge of one hook receipt; values were captured synchronously at hook time. */
+  function mergeToolHook(
+    st: SessionState,
+    facts: {
+      assistantMessageID: string
+      toolCallID: string
+      name: string
+      status: "completed" | "error"
+      input: unknown
+      output: unknown
+      exit: number | undefined
+      errorMessage: string | undefined
+      fallbackEnd: number
+    },
+  ): void {
+    const observationId = toolObservationId(st.sessionID, facts.assistantMessageID, facts.toolCallID)
+    let entry = st.tools.get(observationId)
+    if (!entry) {
+      if (!admitTool(st, observationId)) {
+        return
+      }
+      entry = newToolEntry(st.sessionID, facts.assistantMessageID, facts.toolCallID, observationId)
+      entry.admitted = true
+      // Hook receipt without a called fact: admitted, no fabricated start time.
+      entry.record.startBoundary = "unavailable"
+      st.tools.set(observationId, entry)
+      ledgerToolAdmit(st, facts.assistantMessageID, facts.toolCallID)
+    }
+    entry.hookSeen = true
+    const record = entry.record
+    if (record.name === undefined) {
+      record.name = facts.name
+    }
+    // The hook's final input replaces any earlier captured value (detached at receipt).
+    if (facts.input !== undefined) {
+      record.input = facts.input
+    }
+    // Enrichment only — a late hook never downgrades already-captured output or messages.
+    if (record.output === undefined && facts.output !== undefined) {
+      record.output = facts.output
+    }
+    if (record.statusMessage === undefined && facts.errorMessage !== undefined) {
+      record.statusMessage = facts.errorMessage
+    }
+    if (record.exitCode === undefined && facts.exit !== undefined) {
+      record.exitCode = facts.exit
+    }
+    // The actual hook status is authoritative; relabel the outcome source when it changes the outcome.
+    const previousNative = record.nativeStatus
+    record.nativeStatus = facts.status
+    if (previousNative === undefined || previousNative !== facts.status) {
+      record.outcomeSource = "execute.after"
+    }
+    if (!entry.terminalSeen) {
+      // Tagged fallback end boundary; a matching durable terminal's `created` replaces it.
+      record.endTime = facts.fallbackEnd
+      record.endBoundary = "execute.after"
+      entry.endFromHookFallback = true
+    }
+    entry.terminalSeen = true
+    settleToolOutcome(record)
+    syncLedgerToolOutcome(st, record)
+    evaluateScores(st)
+    entry.dirty = true
+    requestExport(st)
+    extendRootForChildTerminal(st, facts.fallbackEnd)
   }
 
   function envelopeSessionID(type: string, data: unknown): string | undefined {
@@ -810,7 +1744,9 @@ export function createTracker(options: TrackerOptions): Tracker {
         )
         const startIso = toIso(st.createdAt)
         const endMs =
-          st.rootEndedAt !== undefined ? Math.max(st.rootEndedAt, st.auxTerminalMax ?? st.rootEndedAt) : undefined
+          st.rootEndedAt !== undefined
+            ? Math.max(st.rootEndedAt, st.observedChildTerminalMax ?? st.rootEndedAt)
+            : undefined
         const endIso = toIso(endMs)
         const langfuseSessionId = truncate(st.sessionID, LANGFUSE_SESSION_ID_MAX)
 
@@ -869,6 +1805,38 @@ export function createTracker(options: TrackerOptions): Tracker {
         )
       }
 
+      // Unnameable records are never exported; they wait (or get dropped at
+      // terminal/shutdown with a diagnostic).
+      for (const entry of st.tools.values()) {
+        if (!entry.dirty || entry.record.name === undefined) {
+          continue
+        }
+        const phase = entry.createExported ? "update" : "create"
+        events.push(buildToolEvent(entry.record, st.identity, phase, newId(), emittedAt, policy))
+      }
+
+      for (const entry of st.compactions.values()) {
+        if (!entry.dirty) {
+          continue
+        }
+        const phase = entry.createExported ? "update" : "create"
+        events.push(buildCompactionEvent(entry.record, st.identity, phase, newId(), emittedAt, policy))
+      }
+
+      // Cumulative scores publish only for a ready revision; the submitted
+      // revision is snapshotted below, before the POST.
+      let scoreRevision: ScoreCounts | undefined
+      if (st.scoresDirty) {
+        const revision = scoreRevisionOf(st)
+        if (revision) {
+          scoreRevision = revision
+          const scores = computeScores(revision)
+          for (const name of SCORE_NAMES as readonly ScoreName[]) {
+            events.push(buildScoreEvent(name, scores[name], st.identity.traceId, scoreId(st.sessionID, name), newId(), emittedAt))
+          }
+        }
+      }
+
       if (events.length === 0) {
         return
       }
@@ -885,6 +1853,24 @@ export function createTracker(options: TrackerOptions): Tracker {
           entry.createExported = true
         }
       }
+      for (const entry of st.tools.values()) {
+        if (entry.dirty && entry.record.name !== undefined) {
+          entry.dirty = false
+          entry.createExported = true
+        }
+      }
+      for (const entry of st.compactions.values()) {
+        if (entry.dirty) {
+          entry.dirty = false
+          entry.createExported = true
+        }
+      }
+      // Only the actually submitted score revision is published/cleared;
+      // changes during the held POST stay dirty for the next batch.
+      if (scoreRevision) {
+        st.scoresDirty = false
+        st.publishedScores = scoreRevision
+      }
 
       const result = await transport.ingest(events, signal ? { signal } : undefined)
       if (result.failed > 0) {
@@ -892,7 +1878,9 @@ export function createTracker(options: TrackerOptions): Tracker {
       }
       resetCapacityEpisode(st)
       pruneSettledGenerations(st)
-      if (pendingGenerationCount(st) > 0 || st.rootDirty) {
+      pruneSettledTools(st)
+      pruneSettledCompactions(st)
+      if (pendingGenerationCount(st) > 0 || pendingToolCount(st) > 0 || pendingCompactionCount(st) > 0 || st.rootDirty || st.scoresDirty) {
         requestExport(st)
       }
     } finally {
@@ -981,7 +1969,7 @@ export function createTracker(options: TrackerOptions): Tracker {
       }
       applyAuxTerminal(entry.record, descriptor)
       if (st && st.rootEndedAt !== undefined && completion.at > st.rootEndedAt) {
-        st.auxTerminalMax = Math.max(st.auxTerminalMax ?? completion.at, completion.at)
+        st.observedChildTerminalMax = Math.max(st.observedChildTerminalMax ?? completion.at, completion.at)
         st.rootDirty = true
       }
       entry.dirty = true
@@ -1038,7 +2026,7 @@ export function createTracker(options: TrackerOptions): Tracker {
       return enqueueState(sessionID, async () => {
         // The event was accepted before this task ran, so its session may still
         // be created even when shutdown began in the meantime.
-        const st = await reconcile(sessionID, created, true)
+        const st = await reconcile(sessionID, created, true, type === "session.created" ? "session.created" : undefined)
         if (!st || !rememberDurable(st, durable, envelopeId)) {
           return
         }
@@ -1079,6 +2067,16 @@ export function createTracker(options: TrackerOptions): Tracker {
             st.rootDirty = true
             break
           }
+          case "session.execution.started": {
+            const parsed = executionStartedSchema.safeParse(envelope.data.data)
+            if (!parsed.success) {
+              diagnostic(`malformed session.execution.started for ${sessionID}`)
+              return
+            }
+            // Distinct score execution-active boundary; the terminal events publish.
+            st.executionActive = true
+            break
+          }
           case "session.execution.succeeded": {
             markExecutionTerminal(st, created)
             requestExport(st)
@@ -1108,6 +2106,8 @@ export function createTracker(options: TrackerOptions): Tracker {
                 entry.dirty = true
               }
             }
+            interruptRunningTools(st, "session.execution.interrupted")
+            interruptRunningCompactions(st, "session.execution.interrupted")
             requestExport(st)
             break
           }
@@ -1126,6 +2126,7 @@ export function createTracker(options: TrackerOptions): Tracker {
               diagnostic(`malformed session.step.streamed for ${sessionID}`)
               return
             }
+            ledgerTurn(st, parsed.data.assistantMessageID)
             const observationId = primaryObservationId(sessionID, parsed.data.assistantMessageID)
             if (!st.generations.has(observationId)) {
               const recovered = await missingStart(st, parsed.data.assistantMessageID)
@@ -1143,6 +2144,7 @@ export function createTracker(options: TrackerOptions): Tracker {
               diagnostic(`malformed session.step.ended for ${sessionID}`)
               return
             }
+            ledgerTurn(st, parsed.data.assistantMessageID)
             const observationId = primaryObservationId(sessionID, parsed.data.assistantMessageID)
             let recoveredStreamedAt: number | undefined
             if (!st.generations.has(observationId)) {
@@ -1161,6 +2163,8 @@ export function createTracker(options: TrackerOptions): Tracker {
               diagnostic(`malformed session.step.failed for ${sessionID}`)
               return
             }
+            // Provider failures still count their primary turn.
+            ledgerTurn(st, parsed.data.assistantMessageID)
             const observationId = primaryObservationId(sessionID, parsed.data.assistantMessageID)
             if (!st.generations.has(observationId)) {
               const recovered = await missingStart(st, parsed.data.assistantMessageID)
@@ -1169,6 +2173,83 @@ export function createTracker(options: TrackerOptions): Tracker {
               }
             }
             await handleStepFailed(st, parsed.data, created)
+            break
+          }
+          case "session.tool.input.started": {
+            const parsed = toolInputStartedSchema.safeParse(envelope.data.data)
+            if (!parsed.success) {
+              diagnostic(`malformed session.tool.input.started for ${sessionID}`)
+              return
+            }
+            // Name hint only: input.started never creates or counts an executed call.
+            const key = `${parsed.data.assistantMessageID}\u0000${parsed.data.id}`
+            if (!st.toolNames.has(key)) {
+              st.toolNames.set(key, parsed.data.name)
+              if (st.toolNames.size > MAX_PENDING_TOOLS_PER_SESSION) {
+                const oldest = st.toolNames.keys().next().value
+                if (oldest !== undefined) {
+                  st.toolNames.delete(oldest)
+                }
+              }
+            }
+            break
+          }
+          case "session.tool.called": {
+            const parsed = toolCalledSchema.safeParse(envelope.data.data)
+            if (!parsed.success) {
+              diagnostic(`malformed session.tool.called for ${sessionID}`)
+              return
+            }
+            await handleToolCalled(st, parsed.data, created)
+            break
+          }
+          case "session.tool.success": {
+            const parsed = toolSuccessSchema.safeParse(envelope.data.data)
+            if (!parsed.success) {
+              diagnostic(`malformed session.tool.success for ${sessionID}`)
+              return
+            }
+            await handleToolTerminal(st, "success", parsed.data, created)
+            break
+          }
+          case "session.tool.failed": {
+            const parsed = toolFailedSchema.safeParse(envelope.data.data)
+            if (!parsed.success) {
+              diagnostic(`malformed session.tool.failed for ${sessionID}`)
+              return
+            }
+            await handleToolTerminal(st, "failed", parsed.data, created)
+            break
+          }
+          case "session.compaction.started": {
+            const parsed = compactionStartedSchema.safeParse(envelope.data.data)
+            const seq = durable?.seq
+            if (!parsed.success || typeof seq !== "number") {
+              // Fail open: a malformed lifecycle fact never blocks other telemetry.
+              diagnostic(`malformed session.compaction.started for ${sessionID}`)
+              return
+            }
+            handleCompactionStarted(st, parsed.data, created, seq)
+            break
+          }
+          case "session.compaction.ended": {
+            const parsed = compactionEndedSchema.safeParse(envelope.data.data)
+            const seq = durable?.seq
+            if (!parsed.success || typeof seq !== "number") {
+              diagnostic(`malformed session.compaction.ended for ${sessionID}`)
+              return
+            }
+            handleCompactionEnded(st, parsed.data, created, seq)
+            break
+          }
+          case "session.compaction.failed": {
+            const parsed = compactionFailedSchema.safeParse(envelope.data.data)
+            const seq = durable?.seq
+            if (!parsed.success || typeof seq !== "number") {
+              diagnostic(`malformed session.compaction.failed for ${sessionID}`)
+              return
+            }
+            handleCompactionFailed(st, parsed.data, created, seq)
             break
           }
         }
@@ -1215,6 +2296,46 @@ export function createTracker(options: TrackerOptions): Tracker {
       return observed.response
     },
 
+    handleToolAfter(event: unknown): void {
+      if (closed) {
+        return
+      }
+      const parsed = toolAfterSchema.safeParse(event)
+      if (!parsed.success) {
+        diagnostic("malformed tool execute.after payload; dropped")
+        return
+      }
+      const data = parsed.data
+      // Capture once, synchronously, into detached policy-gated values before
+      // enqueueing: the native tool pipeline is never awaited or mutated, and
+      // nothing here can block provider delivery.
+      const input = captureHookToolInput(data.input, policy)
+      const output = data.status === "completed" ? captureHookToolOutput(data.result, policy) : undefined
+      const exit =
+        data.status === "completed" && isRecord(data.result) && isRecord(data.result.metadata)
+          ? nativeExit(data.result.metadata.exit)
+          : undefined
+      const errorMessage = data.status === "error" ? boundedNativeMessage(data.error?.message) : undefined
+      const fallbackEnd = now()
+      void enqueueState(data.sessionID, async () => {
+        const st = await reconcile(data.sessionID, fallbackEnd, true)
+        if (!st) {
+          return
+        }
+        mergeToolHook(st, {
+          assistantMessageID: data.messageID,
+          toolCallID: data.id,
+          name: data.tool,
+          status: data.status,
+          input,
+          output,
+          exit,
+          errorMessage,
+          fallbackEnd,
+        })
+      }).catch((error) => diagnostic(`tool after-hook update failed: ${String(error)}`))
+    },
+
     async flushNow(sessionID: string): Promise<void> {
       if (closed) {
         return
@@ -1247,7 +2368,15 @@ export function createTracker(options: TrackerOptions): Tracker {
     pendingSessionIds(): string[] {
       const ids: string[] = []
       for (const st of states.values()) {
-        if (st.rootDirty || st.exporting || (pendingWorkBySession.get(st.sessionID) ?? 0) > 0 || pendingGenerationCount(st) > 0) {
+        if (
+          st.rootDirty ||
+          st.scoresDirty ||
+          st.exporting ||
+          (pendingWorkBySession.get(st.sessionID) ?? 0) > 0 ||
+          pendingGenerationCount(st) > 0 ||
+          pendingToolCount(st) > 0 ||
+          pendingCompactionCount(st) > 0
+        ) {
           ids.push(st.sessionID)
         }
       }
@@ -1289,6 +2418,8 @@ export function createTracker(options: TrackerOptions): Tracker {
                 entry.dirty = true
               }
             }
+            interruptRunningTools(st, "plugin.shutdown")
+            interruptRunningCompactions(st, "plugin.shutdown")
           }
           // Finish accepted state work within the budget.
           await Promise.race([Promise.allSettled([...stateChains.values()].map((p) => p.catch(noop))), deadlinePromise])
@@ -1302,6 +2433,8 @@ export function createTracker(options: TrackerOptions): Tracker {
                 entry.dirty = true
               }
             }
+            interruptRunningTools(st, "plugin.shutdown")
+            interruptRunningCompactions(st, "plugin.shutdown")
           }
           // Drain dirty batches and in-flight ingestion, aborting at expiry.
           await Promise.race([
@@ -1316,7 +2449,7 @@ export function createTracker(options: TrackerOptions): Tracker {
           ])
           if (aborted) {
             const unsettled = [...states.values()].filter(
-              (st) => st.rootDirty || pendingGenerationCount(st) > 0,
+              (st) => st.rootDirty || pendingGenerationCount(st) > 0 || pendingToolCount(st) > 0 || pendingCompactionCount(st) > 0,
             ).length
             if (unsettled > 0) {
               log(`Shutdown drain incomplete for ${unsettled} session(s) after ${shutdownTimeoutMs}ms`)
